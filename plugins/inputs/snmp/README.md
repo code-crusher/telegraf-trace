@@ -22,8 +22,8 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 ## Secret store support
 
-This plugin supports secrets from secret stores for the `auth_password` and
-`priv_password` option.
+This plugin supports secrets from secret stores for the `community`,
+`sec_name`, `auth_password` and `priv_password` option.
 See the [secret store documentation][SECRETSTORE] for more details on how
 to use them.
 
@@ -65,6 +65,7 @@ to use them.
   # path = ["/usr/share/snmp/mibs"]
 
   ## SNMP community string.
+  ## This option supports secret-store references, e.g. @{store-id:key}.
   # community = "public"
 
   ## Agent host tag; should be set to "source" for consistent usage across plugins
@@ -84,6 +85,7 @@ to use them.
   ## SNMPv3 authentication and encryption options.
   ##
   ## Security Name.
+  ## This option supports secret-store references, e.g. @{store-id:key}.
   # sec_name = "myuser"
   ## Authentication protocol; one of "MD5", "SHA", "SHA224", "SHA256", "SHA384", "SHA512" or "".
   # auth_protocol = "MD5"

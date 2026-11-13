@@ -212,7 +212,7 @@ func init() {
 			Timeout:        config.Duration(5 * time.Second),
 			Version:        2,
 			Path:           []string{"/usr/share/snmp/mibs"},
-			Community:      "public",
+			Community:      config.NewSecret([]byte("public")),
 		}
 	})
 }

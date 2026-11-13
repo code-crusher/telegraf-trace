@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/gosnmp/gosnmp"
+	"github.com/influxdata/toml"
 	"github.com/stretchr/testify/require"
 
+	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/common/snmp"
 	"github.com/influxdata/telegraf/testutil"
@@ -127,6 +129,44 @@ func TestSnmpInit(t *testing.T) {
 	require.NoError(t, s.Init())
 }
 
+func TestSecretReferences(t *testing.T) {
+	cfg := []byte(`
+		agents = ["udp://127.0.0.1:161"]
+		version = 2
+		community = "@{store:community}"
+		sec_name = "@{store:sec_name}"
+	`)
+
+	var s Snmp
+	require.NoError(t, toml.Unmarshal(cfg, &s))
+	defer s.Community.Destroy()
+	defer s.SecName.Destroy()
+
+	// The references must be tracked as secrets and not used literally
+	_, err := s.Community.Get()
+	require.ErrorContains(t, err, "unlinked parts in secret")
+	_, err = s.SecName.Get()
+	require.ErrorContains(t, err, "unlinked parts in secret")
+
+	// Linking the secrets must resolve the references
+	resolvers := map[string]telegraf.ResolveFunc{
+		"@{store:community}": func() ([]byte, bool, error) { return []byte("private"), false, nil },
+		"@{store:sec_name}":  func() ([]byte, bool, error) { return []byte("myuser"), false, nil },
+	}
+	require.NoError(t, s.Community.Link(resolvers))
+	require.NoError(t, s.SecName.Link(resolvers))
+
+	community, err := s.Community.Get()
+	require.NoError(t, err)
+	defer community.Destroy()
+	require.Equal(t, "private", community.String())
+
+	secname, err := s.SecName.Get()
+	require.NoError(t, err)
+	defer secname.Destroy()
+	require.Equal(t, "myuser", secname.String())
+}
+
 func TestSnmpInit_noTranslate(t *testing.T) {
 	s := &Snmp{
 		Fields: []snmp.Field{
@@ -194,7 +234,7 @@ func TestGetSNMPConnection_v2(t *testing.T) {
 		Timeout:    config.Duration(3 * time.Second),
 		Retries:    4,
 		Version:    2,
-		Community:  "foo",
+		Community:  config.NewSecret([]byte("foo")),
 		Translator: "netsnmp",
 	}
 	require.NoError(t, s.Init())
@@ -251,7 +291,7 @@ func TestGetSNMPConnection_v3(t *testing.T) {
 		MaxRepetitions: 20,
 		ContextName:    "mycontext",
 		SecLevel:       "authPriv",
-		SecName:        "myuser",
+		SecName:        config.NewSecret([]byte("myuser")),
 		AuthProtocol:   "md5",
 		AuthPassword:   config.NewSecret([]byte("password123")),
 		PrivProtocol:   "des",
@@ -298,7 +338,7 @@ func TestGetSNMPConnection_v3_blumenthal(t *testing.T) {
 				MaxRepetitions: 20,
 				ContextName:    "mycontext",
 				SecLevel:       "authPriv",
-				SecName:        "myuser",
+				SecName:        config.NewSecret([]byte("myuser")),
 				AuthProtocol:   "md5",
 				AuthPassword:   config.NewSecret([]byte("password123")),
 				PrivProtocol:   "AES192",
@@ -318,7 +358,7 @@ func TestGetSNMPConnection_v3_blumenthal(t *testing.T) {
 				MaxRepetitions: 20,
 				ContextName:    "mycontext",
 				SecLevel:       "authPriv",
-				SecName:        "myuser",
+				SecName:        config.NewSecret([]byte("myuser")),
 				AuthProtocol:   "md5",
 				AuthPassword:   config.NewSecret([]byte("password123")),
 				PrivProtocol:   "AES192C",
@@ -338,7 +378,7 @@ func TestGetSNMPConnection_v3_blumenthal(t *testing.T) {
 				MaxRepetitions: 20,
 				ContextName:    "mycontext",
 				SecLevel:       "authPriv",
-				SecName:        "myuser",
+				SecName:        config.NewSecret([]byte("myuser")),
 				AuthProtocol:   "md5",
 				AuthPassword:   config.NewSecret([]byte("password123")),
 				PrivProtocol:   "AES256",
@@ -358,7 +398,7 @@ func TestGetSNMPConnection_v3_blumenthal(t *testing.T) {
 				MaxRepetitions: 20,
 				ContextName:    "mycontext",
 				SecLevel:       "authPriv",
-				SecName:        "myuser",
+				SecName:        config.NewSecret([]byte("myuser")),
 				AuthProtocol:   "md5",
 				AuthPassword:   config.NewSecret([]byte("password123")),
 				PrivProtocol:   "AES256C",

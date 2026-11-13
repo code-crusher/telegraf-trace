@@ -17,8 +17,8 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 ## Secret store support
 
-This plugin supports secrets from secret stores for the `auth_password` and
-`priv_password` option.
+This plugin supports secrets from secret stores for the `community`,
+`sec_name`, `auth_password` and `priv_password` option.
 See the [secret store documentation][SECRETSTORE] for more details on how
 to use them.
 
@@ -42,6 +42,7 @@ to use them.
   # version = 2
 
   ## SNMP community string.
+  ## This option supports secret-store references, e.g. @{store-id:key}.
   # community = "public"
 
   ## Number of retries to attempt.
@@ -53,6 +54,7 @@ to use them.
   ## SNMPv3 authentication and encryption options.
   ##
   ## Security Name.
+  ## This option supports secret-store references, e.g. @{store-id:key}.
   # sec_name = "myuser"
   ## Authentication protocol; one of "MD5", "SHA", or "".
   # auth_protocol = "MD5"

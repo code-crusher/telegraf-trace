@@ -16,7 +16,7 @@ type ClientConfig struct {
 	GosnmpDebugLogger    telegraf.Logger `toml:"-"`
 
 	// Parameters for Version 1 & 2
-	Community string `toml:"community"`
+	Community config.Secret `toml:"community"`
 
 	// Parameters for Version 2 & 3
 	MaxRepetitions uint32 `toml:"max_repetitions"`
@@ -24,7 +24,7 @@ type ClientConfig struct {
 	// Parameters for Version 3
 	ContextName  string        `toml:"context_name"`
 	SecLevel     string        `toml:"sec_level"`
-	SecName      string        `toml:"sec_name"`
+	SecName      config.Secret `toml:"sec_name"`
 	AuthProtocol string        `toml:"auth_protocol"`
 	AuthPassword config.Secret `toml:"auth_password"`
 	PrivProtocol string        `toml:"priv_protocol"`
@@ -45,10 +45,10 @@ func DefaultClientConfig() *ClientConfig {
 		Version:        2,
 		Path:           []string{"/usr/share/snmp/mibs"},
 		Translator:     "gosmi",
-		Community:      "public",
+		Community:      config.NewSecret([]byte("public")),
 		MaxRepetitions: 10,
 		SecLevel:       "authNoPriv",
-		SecName:        "myuser",
+		SecName:        config.NewSecret([]byte("myuser")),
 		AuthProtocol:   "MD5",
 		AuthPassword:   config.NewSecret([]byte("pass")),
 	}

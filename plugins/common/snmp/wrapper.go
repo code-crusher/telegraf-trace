@@ -78,10 +78,14 @@ func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
 	}
 
 	if s.Version < 3 {
-		if s.Community == "" {
-			gs.Community = "public"
-		} else {
-			gs.Community = s.Community
+		gs.Community = "public"
+		if !s.Community.Empty() {
+			p, err := s.Community.Get()
+			if err != nil {
+				return GosnmpWrapper{}, fmt.Errorf("getting community failed: %w", err)
+			}
+			gs.Community = p.String()
+			p.Destroy()
 		}
 	}
 
@@ -109,7 +113,14 @@ func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
 			return GosnmpWrapper{}, errors.New("invalid secLevel")
 		}
 
-		sp.UserName = s.SecName
+		if !s.SecName.Empty() {
+			p, err := s.SecName.Get()
+			if err != nil {
+				return GosnmpWrapper{}, fmt.Errorf("getting security name failed: %w", err)
+			}
+			sp.UserName = p.String()
+			p.Destroy()
+		}
 
 		switch strings.ToLower(s.AuthProtocol) {
 		case "md5":

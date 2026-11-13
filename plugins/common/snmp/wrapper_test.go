@@ -5,6 +5,9 @@ import (
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/stretchr/testify/require"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 )
 
 type testSNMPConnection struct {
@@ -55,8 +58,150 @@ func (*testSNMPConnection) Close() error {
 	return nil
 }
 
+func TestNewWrapperCommunity(t *testing.T) {
+	tests := []struct {
+		name     string
+		create   func(*testing.T) config.Secret
+		expected string
+	}{
+		{
+			name:     "unset",
+			expected: "public",
+		},
+		{
+			name:     "static",
+			create:   staticSecret("private"),
+			expected: "private",
+		},
+		{
+			name:     "secret reference",
+			create:   linkedSecret("@{store:community}", "private"),
+			expected: "private",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ClientConfig{Version: 2}
+			if tt.create != nil {
+				cfg.Community = tt.create(t)
+			}
+
+			gs, err := NewWrapper(cfg)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, gs.Community)
+		})
+	}
+}
+
+func TestNewWrapperSecName(t *testing.T) {
+	tests := []struct {
+		name     string
+		create   func(*testing.T) config.Secret
+		expected string
+	}{
+		{
+			name: "unset",
+		},
+		{
+			name:     "static",
+			create:   staticSecret("myuser"),
+			expected: "myuser",
+		},
+		{
+			name:     "secret reference",
+			create:   linkedSecret("@{store:sec_name}", "myuser"),
+			expected: "myuser",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ClientConfig{Version: 3, SecLevel: "noAuthNoPriv"}
+			if tt.create != nil {
+				cfg.SecName = tt.create(t)
+			}
+
+			gs, err := NewWrapper(cfg)
+			require.NoError(t, err)
+			usm, ok := gs.SecurityParameters.(*gosnmp.UsmSecurityParameters)
+			require.True(t, ok)
+			require.Equal(t, tt.expected, usm.UserName)
+		})
+	}
+}
+
+func TestNewWrapperUnlinkedSecret(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ClientConfig
+		expected string
+	}{
+		{
+			name: "community",
+			config: ClientConfig{
+				Version:   2,
+				Community: unlinkedSecret(t, "@{store:community}"),
+			},
+			expected: "getting community failed",
+		},
+		{
+			name: "sec_name",
+			config: ClientConfig{
+				Version: 3,
+				SecName: unlinkedSecret(t, "@{store:sec_name}"),
+			},
+			expected: "getting security name failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewWrapper(tt.config)
+			require.ErrorContains(t, err, tt.expected)
+		})
+	}
+}
+
+func staticSecret(value string) func(*testing.T) config.Secret {
+	return func(t *testing.T) config.Secret {
+		t.Helper()
+
+		s := config.NewSecret([]byte(value))
+		t.Cleanup(s.Destroy)
+
+		return s
+	}
+}
+
+func linkedSecret(reference, value string) func(*testing.T) config.Secret {
+	return func(t *testing.T) config.Secret {
+		t.Helper()
+
+		s := unlinkedSecret(t, reference)
+		resolvers := map[string]telegraf.ResolveFunc{
+			reference: func() ([]byte, bool, error) {
+				return []byte(value), false, nil
+			},
+		}
+		require.NoError(t, s.Link(resolvers))
+
+		return s
+	}
+}
+
+func unlinkedSecret(t *testing.T, reference string) config.Secret {
+	t.Helper()
+
+	var s config.Secret
+	require.NoError(t, s.UnmarshalText([]byte(reference)))
+	t.Cleanup(s.Destroy)
+
+	return s
+}
+
 func TestReconnectResetsEngineID(t *testing.T) {
-	gs, err := NewWrapper(ClientConfig{Version: 3, SecName: "user", EngineID: "stale", EngineBoots: 3, EngineTime: 42})
+	gs, err := NewWrapper(ClientConfig{Version: 3, SecName: config.NewSecret([]byte("user")), EngineID: "stale", EngineBoots: 3, EngineTime: 42})
 	require.NoError(t, err)
 	require.NoError(t, gs.SetAgent("udp://127.0.0.1:161"))
 	require.NoError(t, gs.Connect())
