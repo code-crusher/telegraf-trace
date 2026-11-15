@@ -33,6 +33,12 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
   ## Override the default (5s) request timeout
   # timeout = "5s"
 
+  ## Drop metrics older than this duration instead of retrying them forever.
+  ## Useful when the destination rejects samples older than a certain age,
+  ## e.g. Mimir with out-of-order ingestion disabled rejects samples older
+  ## than ~1h. Disabled by default.
+  # metrics_expiry = "60m"
+
   ## Optional TLS Config.
   ##
   ## Root certificates for verifying server certificates encoded in PEM format.

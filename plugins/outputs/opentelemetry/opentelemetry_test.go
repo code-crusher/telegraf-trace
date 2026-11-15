@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/testutil"
 )
@@ -282,6 +284,106 @@ func TestOpenTelemetryHTTPJSON(t *testing.T) {
 	require.NoError(t, err)
 
 	require.JSONEq(t, string(expectJSON), string(gotJSON))
+}
+
+func TestOpenTelemetryMetricsExpiry(t *testing.T) {
+	m := newMockOtelService(t)
+	t.Cleanup(m.Cleanup)
+
+	metricsConverter, err := influx2otel.NewLineProtocolToOtelMetrics(common.NoopLogger{})
+	require.NoError(t, err)
+
+	now := time.Now().Truncate(time.Second)
+	plugin := &OpenTelemetry{
+		ServiceAddress:   m.Address(),
+		Timeout:          config.Duration(time.Second),
+		Headers:          map[string]string{"test": "header1"},
+		MetricsExpiry:    config.Duration(time.Minute),
+		metricsConverter: metricsConverter,
+		otlpMetricClient: &gRPCClient{
+			grpcClientConn:       m.GrpcClient(),
+			metricsServiceClient: pmetricotlp.NewGRPCClient(m.GrpcClient()),
+		},
+		Log:      testutil.Logger{},
+		timeFunc: func() time.Time { return now },
+	}
+
+	// A metric too old for the destination and a fresh one
+	tooOld := metric.New(
+		"cpu_temp",
+		map[string]string{"foo": "bar"},
+		map[string]any{"gauge": 42.0},
+		now.Add(-2*time.Hour),
+	)
+	fresh := metric.New(
+		"cpu_temp",
+		map[string]string{"foo": "bar"},
+		map[string]any{"gauge": 87.332},
+		now,
+	)
+
+	err = plugin.Write([]telegraf.Metric{tooOld, fresh})
+	require.Error(t, err)
+	var writeErr *internal.PartialWriteError
+	require.ErrorAs(t, err, &writeErr)
+	require.Equal(t, []int{0}, writeErr.MetricsReject)
+	require.Equal(t, []int{1}, writeErr.MetricsAccept)
+
+	// Only the fresh metric must have been sent to the destination
+	got := m.GotMetrics()
+	require.Equal(t, 1, got.ResourceMetrics().Len())
+	require.Equal(t, 1, got.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().Len())
+	dp := got.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
+	require.Equal(t, 87.332, dp.DoubleValue())
+}
+
+func TestOpenTelemetryMetricsExpiryOnError(t *testing.T) {
+	// The destination rejects every request, so the fresh metric is kept for
+	// the next write cycle while the expired metric is dropped.
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	metricsConverter, err := influx2otel.NewLineProtocolToOtelMetrics(common.NoopLogger{})
+	require.NoError(t, err)
+
+	now := time.Now().Truncate(time.Second)
+	plugin := &OpenTelemetry{
+		ServiceAddress:   server.URL,
+		EncodingType:     "protobuf",
+		Timeout:          config.Duration(time.Second),
+		Compression:      "none",
+		MetricsExpiry:    config.Duration(time.Minute),
+		metricsConverter: metricsConverter,
+		Log:              testutil.Logger{},
+		timeFunc:         func() time.Time { return now },
+	}
+	require.NoError(t, plugin.Connect())
+
+	tooOld := metric.New(
+		"cpu_temp",
+		map[string]string{"foo": "bar"},
+		map[string]any{"gauge": 42.0},
+		now.Add(-2*time.Hour),
+	)
+	fresh := metric.New(
+		"cpu_temp",
+		map[string]string{"foo": "bar"},
+		map[string]any{"gauge": 87.332},
+		now,
+	)
+
+	err = plugin.Write([]telegraf.Metric{tooOld, fresh})
+	require.Error(t, err)
+	var writeErr *internal.PartialWriteError
+	require.ErrorAs(t, err, &writeErr)
+	require.Equal(t, []int{0}, writeErr.MetricsReject)
+	// The fresh metric was not accepted as the request failed
+	require.Empty(t, writeErr.MetricsAccept)
+	require.Equal(t, int32(1), atomic.LoadInt32(&requests))
 }
 
 func TestConnectInvalidProxy(t *testing.T) {

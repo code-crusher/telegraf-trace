@@ -63,6 +63,11 @@
   If you set `default_service_state`, it now also applies to metrics with
   numeric fields but without thresholds, which used to get `SERVICE_OK`.
   Please check alerts relying on these states.
+
+### Features
+
+- [#19945](https://github.com/influxdata/telegraf/pull/19945) `outputs.opentelemetry` Add `metrics_expiry` option to drop metrics older than a given age instead of retrying them forever
+
 ## v1.40.3 [2026-11-02]
 
 ### Bugfixes
