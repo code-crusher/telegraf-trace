@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -318,6 +319,24 @@ type AgentConfig struct {
 	// metrics buffered in the last `flush_interval` in the event of a power
 	// cut.
 	BufferDiskSync *bool `toml:"buffer_disk_sync"`
+
+	// MemoryPressureThreshold is the fraction of the Go runtime memory
+	// limit (GOMEMLIMIT) at which Telegraf considers itself to be under
+	// memory pressure. The memory usage is measured as
+	// runtime.MemStats.Sys - runtime.MemStats.HeapReleased. When set to a
+	// value greater than 0, Telegraf checks the memory usage after every
+	// garbage collection cycle and flushes the output buffers when usage
+	// exceeds the configured fraction of the limit. Setting the threshold to
+	// 0 disables the check. Defaults to 0.
+	MemoryPressureThreshold float64 `toml:"memory_pressure_threshold"`
+
+	// MemoryPressureDrop controls what happens to buffered metrics when
+	// Telegraf is under memory pressure. When true, the oldest metrics are
+	// dropped as if the buffer had reached its capacity, as described for
+	// "metric_buffer_limit". When false, Telegraf only triggers a flush of
+	// the output buffers. Requires MemoryPressureThreshold to be set.
+	// Only applies to the memory buffer strategy.
+	MemoryPressureDrop bool `toml:"memory_pressure_drop"`
 }
 
 // InputNames returns a list of strings of the configured inputs.
@@ -657,6 +676,9 @@ func (c *Config) LoadConfigData(data []byte, path string) error {
 		}
 		if c.Agent.CollectionOffset < 0 {
 			return fmt.Errorf("agent collection_offset must not be negative, found %v", c.Agent.CollectionOffset)
+		}
+		if c.Agent.MemoryPressureThreshold < 0 || c.Agent.MemoryPressureThreshold > 1 || math.IsNaN(c.Agent.MemoryPressureThreshold) {
+			return fmt.Errorf("agent memory_pressure_threshold must be between 0 and 1, found %v", c.Agent.MemoryPressureThreshold)
 		}
 	}
 
@@ -1768,12 +1790,14 @@ func (c *Config) buildOutput(name, source string, tbl *ast.Table) (*models.Outpu
 	}
 
 	oc := &models.OutputConfig{
-		Name:            name,
-		Source:          source,
-		Filter:          filter,
-		BufferStrategy:  bufferStrategy,
-		BufferDirectory: c.Agent.BufferDirectory,
-		BufferDiskSync:  bufferDiskSync,
+		Name:                    name,
+		Source:                  source,
+		Filter:                  filter,
+		BufferStrategy:          bufferStrategy,
+		BufferDirectory:         c.Agent.BufferDirectory,
+		BufferDiskSync:          bufferDiskSync,
+		MemoryPressureThreshold: c.Agent.MemoryPressureThreshold,
+		MemoryPressureDrop:      c.Agent.MemoryPressureDrop,
 	}
 
 	// TODO: support FieldPass/FieldDrop on outputs

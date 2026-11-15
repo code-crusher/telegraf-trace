@@ -19,6 +19,13 @@ type MemoryBuffer struct {
 
 	batchFirst int // index of the first metric in the batch
 	batchSize  int // number of metrics currently in the batch
+
+	// pressure, if set, reports whether the process is under memory
+	// pressure. When dropOnPressure is also set, adding a metric while the
+	// process is under pressure evicts the oldest buffered metric, as if the
+	// buffer had reached its capacity.
+	pressure       func() bool
+	dropOnPressure bool
 }
 
 func NewMemoryBuffer(capacity int, stats BufferStats) (*MemoryBuffer, error) {
@@ -27,6 +34,17 @@ func NewMemoryBuffer(capacity int, stats BufferStats) (*MemoryBuffer, error) {
 		buf:         make([]telegraf.Metric, capacity),
 		cap:         capacity,
 	}, nil
+}
+
+// SetPressureMonitor sets the function used to detect memory pressure. When
+// drop is true new metrics cause the oldest buffered metric to be dropped
+// while the process is under memory pressure, as if the buffer had reached
+// its capacity. A nil pressure function disables pressure based dropping.
+func (b *MemoryBuffer) SetPressureMonitor(pressure func() bool, drop bool) {
+	b.Lock()
+	defer b.Unlock()
+	b.pressure = pressure
+	b.dropOnPressure = drop
 }
 
 func (b *MemoryBuffer) Len() int {
@@ -133,10 +151,17 @@ func (b *MemoryBuffer) length() int {
 
 func (b *MemoryBuffer) addMetric(m telegraf.Metric) int {
 	dropped := 0
-	// Check if Buffer is full
-	if b.size == b.cap {
-		b.metricDropped(b.buf[b.last])
+	underPressure := b.dropOnPressure && b.pressure != nil && b.pressure()
+	// Check if Buffer is full or if the process is under memory pressure and
+	// dropping of metrics is enabled. In both cases the oldest buffered
+	// metric is dropped to make room for the new one.
+	if b.size > 0 && (b.size == b.cap || underPressure) {
+		b.metricDropped(b.buf[b.first])
 		dropped++
+
+		b.buf[b.first] = nil
+		b.first = b.next(b.first)
+		b.size--
 
 		if b.batchSize > 0 {
 			b.batchSize--

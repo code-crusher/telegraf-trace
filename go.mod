@@ -11,6 +11,7 @@ require (
 	cloud.google.com/go/pubsub/v2 v2.8.1
 	cloud.google.com/go/storage v1.70.0
 	collectd.org v0.6.0
+	github.com/CAFxX/gcnotifier v0.1.0
 	github.com/99designs/keyring v1.2.2
 	github.com/Azure/azure-event-hubs-go/v3 v3.6.2
 	github.com/Azure/azure-kusto-go/azkustodata v1.2.3

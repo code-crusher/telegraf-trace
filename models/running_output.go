@@ -9,6 +9,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
+	"github.com/influxdata/telegraf/internal/memlimit"
 	logging "github.com/influxdata/telegraf/logger"
 	"github.com/influxdata/telegraf/selfstat"
 )
@@ -36,6 +37,9 @@ type OutputConfig struct {
 	FlushJitter       time.Duration
 	MetricBufferLimit int
 	MetricBatchSize   int
+
+	MemoryPressureThreshold float64
+	MemoryPressureDrop      bool
 
 	NameOverride string
 	NamePrefix   string
@@ -67,8 +71,10 @@ type RunningOutput struct {
 
 	BatchReady chan time.Time
 
-	buffer Buffer
-	log    telegraf.Logger
+	buffer         Buffer
+	log            telegraf.Logger
+	pressureWatch  *memlimit.Watcher
+	pressureWarned atomic.Bool
 
 	started bool
 	retries uint64
@@ -144,6 +150,15 @@ func NewRunningOutput(output telegraf.Output, config *OutputConfig, batchSize, b
 		log: logger,
 	}
 
+	if config.MemoryPressureThreshold > 0 {
+		ro.pressureWatch = memlimit.NewWatcher(config.MemoryPressureThreshold, ro.onMemoryPressure)
+		if config.MemoryPressureDrop {
+			if buf, ok := b.(*MemoryBuffer); ok {
+				buf.SetPressureMonitor(ro.pressureWatch.Pressure, true)
+			}
+		}
+	}
+
 	return ro, nil
 }
 
@@ -211,6 +226,13 @@ func (r *RunningOutput) Connect() error {
 
 // Close closes the output
 func (r *RunningOutput) Close() {
+	if r.pressureWatch != nil {
+		if err := r.pressureWatch.Close(); err != nil {
+			r.log.Errorf("Error closing memory pressure watcher: %v", err)
+		}
+		r.pressureWatch = nil
+	}
+
 	if err := r.Output.Close(); err != nil {
 		r.log.Errorf("Error closing output: %v", err)
 	}
@@ -285,14 +307,31 @@ func (r *RunningOutput) triggerBatchCheck() {
 	// be issued if a write is already ongoing to avoid event storms when adding
 	// new metrics during write.
 	if r.buffer.Len() >= r.MetricBatchSize && !r.lastWriteFailed.Load() {
-		// Please note: We cannot merge this if into the one above because then
-		// the compare-and-swap condition would always be evaluated and the
-		// swap happens unconditionally from the buffer fullness.
-		if r.writeInFlight.CompareAndSwap(false, true) {
-			select {
-			case r.BatchReady <- time.Now():
-			default:
-			}
+		r.triggerWrite()
+	}
+}
+
+// onMemoryPressure is called by the memory pressure watcher after every GC
+// cycle that observed the process to be under memory pressure. It triggers a
+// flush of the buffer, similar to when the buffer fills up.
+func (r *RunningOutput) onMemoryPressure() {
+	if r.buffer.Len() == 0 || r.lastWriteFailed.Load() {
+		return
+	}
+	if r.pressureWarned.CompareAndSwap(false, true) {
+		r.log.Warnf("Memory usage is close to the configured memory limit, flushing output buffers")
+	}
+	r.triggerWrite()
+}
+
+func (r *RunningOutput) triggerWrite() {
+	// Please note: We cannot merge this if into the callers because then
+	// the compare-and-swap condition would always be evaluated and the
+	// swap happens unconditionally from the buffer fullness.
+	if r.writeInFlight.CompareAndSwap(false, true) {
+		select {
+		case r.BatchReady <- time.Now():
+		default:
 		}
 	}
 }

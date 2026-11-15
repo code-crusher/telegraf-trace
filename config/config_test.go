@@ -147,6 +147,54 @@ func TestConfig_LoadSingleInput(t *testing.T) {
 	require.Equal(t, inputConfig, c.Inputs[0].Config, "Testdata did not produce correct memcached metadata.")
 }
 
+func TestConfig_MemoryPressureThreshold(t *testing.T) {
+	c := config.NewConfig()
+	cfg := []byte(`
+[agent]
+  memory_pressure_threshold = 0.9
+  memory_pressure_drop = true
+
+[[inputs.memcached]]
+  servers = ["localhost"]
+`)
+	require.NoError(t, c.LoadConfigData(cfg, config.EmptySourcePath))
+	require.Equal(t, 0.9, c.Agent.MemoryPressureThreshold)
+	require.True(t, c.Agent.MemoryPressureDrop)
+	require.Len(t, c.Outputs, 0)
+}
+
+func TestConfig_MemoryPressureThresholdInvalid(t *testing.T) {
+	for _, threshold := range []string{"-0.1", "1.1"} {
+		c := config.NewConfig()
+		cfg := []byte(`
+[agent]
+  memory_pressure_threshold = ` + threshold + `
+
+[[inputs.memcached]]
+  servers = ["localhost"]
+`)
+		err := c.LoadConfigData(cfg, config.EmptySourcePath)
+		require.Error(t, err, "threshold %q should be rejected", threshold)
+		require.Contains(t, err.Error(), "memory_pressure_threshold")
+	}
+}
+
+func TestConfig_MemoryPressureThresholdPassedToOutputs(t *testing.T) {
+	c := config.NewConfig()
+	cfg := []byte(`
+[agent]
+  memory_pressure_threshold = 0.8
+  memory_pressure_drop = true
+
+[[outputs.http]]
+  url = "http://example.com"
+`)
+	require.NoError(t, c.LoadConfigData(cfg, config.EmptySourcePath))
+	require.Len(t, c.Outputs, 1)
+	require.Equal(t, 0.8, c.Outputs[0].Config.MemoryPressureThreshold)
+	require.True(t, c.Outputs[0].Config.MemoryPressureDrop)
+}
+
 func TestConfig_InputCollectionJitterExplicitZeroIsSet(t *testing.T) {
 	c := config.NewConfig()
 	cfg := []byte(`

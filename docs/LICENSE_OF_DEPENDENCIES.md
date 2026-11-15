@@ -30,6 +30,7 @@ following works:
 - github.com/Azure/go-ntlmssp [MIT License](https://github.com/Azure/go-ntlmssp/blob/master/LICENSE)
 - github.com/AzureAD/microsoft-authentication-library-for-go [MIT License](https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/main/LICENSE)
 - github.com/BurntSushi/toml [MIT License](https://github.com/BurntSushi/toml/blob/master/COPYING)
+- github.com/CAFxX/gcnotifier [MIT License](https://github.com/CAFxX/gcnotifier/blob/master/LICENSE)
 - github.com/ClickHouse/ch-go [Apache License 2.0](https://github.com/ClickHouse/ch-go/blob/main/LICENSE)
 - github.com/ClickHouse/clickhouse-go [Apache License 2.0](https://github.com/ClickHouse/clickhouse-go/blob/master/LICENSE)
 - github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp [Apache License 2.0](https://github.com/GoogleCloudPlatform/opentelemetry-operations-go/blob/main/LICENSE)

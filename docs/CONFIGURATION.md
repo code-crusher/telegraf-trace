@@ -388,6 +388,26 @@ The agent table configures Telegraf and the defaults used across all plugins.
   buffered in the last `flush_interval` in the event of a power cut.
   Defaults to 'true'.
 
+- **memory_pressure_threshold**:
+  The fraction of the Go runtime memory limit (`GOMEMLIMIT`) at which
+  Telegraf considers itself under memory pressure. The memory usage is
+  measured as `runtime.MemStats.Sys - runtime.MemStats.HeapReleased`, as
+  described in the documentation of `runtime/debug.SetMemoryLimit`. When
+  set to a value greater than 0, Telegraf checks the memory usage after
+  every garbage collection cycle and flushes the output buffers when the
+  usage exceeds the configured fraction of the limit. Note that without a
+  memory limit set via `GOMEMLIMIT` (or `debug.SetMemoryLimit`), no memory
+  pressure can be detected and buffers will only be flushed on the regular
+  flush interval. Defaults to `0` (disabled). Set to e.g. `0.9` to flush
+  output buffers when 90% of the memory limit is in use.
+
+- **memory_pressure_drop**:
+  When memory pressure is detected, drop the oldest buffered metrics
+  instead of only triggering a flush. Metrics are dropped as if the buffer
+  had reached its `metric_buffer_limit`, oldest metrics first. This only
+  applies to the `memory` buffer strategy and requires
+  `memory_pressure_threshold` to be set. Defaults to `false`.
+
 ## Plugins
 
 Telegraf plugins are divided into 4 types: [inputs][], [outputs][],

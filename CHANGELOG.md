@@ -5,6 +5,18 @@
 
 ### Important Changes
 
+- Issue [#19877](https://github.com/influxdata/telegraf/issues/19877) adds two
+  new `[agent]` options, `memory_pressure_threshold` and
+  `memory_pressure_drop`, to deal with outputs whose buffered metrics would
+  otherwise grow until `metric_buffer_limit` is reached. When
+  `memory_pressure_threshold` is set to a fraction of the Go runtime memory
+  limit (`GOMEMLIMIT`), Telegraf checks the memory usage (`runtime.MemStats.Sys
+  - runtime.MemStats.HeapReleased`) after every garbage collection cycle and
+  flushes the output buffers when the usage exceeds the threshold. Setting
+  `memory_pressure_drop` to `true` additionally drops the oldest buffered
+  metrics when under memory pressure, as if the buffer had reached its
+  `metric_buffer_limit`.
+
 - PR [#19774](https://github.com/influxdata/telegraf/pull/19774) makes
   `inputs.socket_listener` bind the context ID given in a `vsock` address
   instead of the local one. A configuration naming a CID that does not belong
