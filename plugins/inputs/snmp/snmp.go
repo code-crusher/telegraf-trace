@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,11 @@ type Snmp struct {
 	connectionCache []snmp.Connection
 
 	translator snmp.Translator
+
+	// inflight tracks the agents whose collection is currently in progress,
+	// keyed by the index into the agents list. It is used to report the
+	// status of a slow collection.
+	inflight sync.Map
 }
 
 func (*Snmp) SampleConfig() string {
@@ -101,8 +107,10 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 	var wg sync.WaitGroup
 	for i, agent := range s.Agents {
 		wg.Add(1)
+		s.inflight.Store(i, struct{}{})
 		go func(i int, agent string) {
 			defer wg.Done()
+			defer s.inflight.Delete(i)
 			gs, err := s.getConnection(i)
 			if err != nil {
 				acc.AddError(fmt.Errorf("agent %s: %w", agent, err))
@@ -140,6 +148,29 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 	wg.Wait()
 
 	return nil
+}
+
+// Status returns the agents that have not finished their collection yet. It
+// is used by the agent to report which agents a slow collection is waiting
+// on.
+func (s *Snmp) Status() string {
+	pending := make(map[int]bool)
+	s.inflight.Range(func(key, value any) bool {
+		pending[key.(int)] = true
+		return true
+	})
+	if len(pending) == 0 {
+		return ""
+	}
+
+	waiting := make([]string, 0, len(pending))
+	for i, agent := range s.Agents {
+		if pending[i] {
+			waiting = append(waiting, agent)
+		}
+	}
+
+	return "waiting on agent(s): " + strings.Join(waiting, ", ")
 }
 
 func (s *Snmp) gatherTable(acc telegraf.Accumulator, gs snmp.Connection, t snmp.Table, topTags map[string]string, walk bool) error {

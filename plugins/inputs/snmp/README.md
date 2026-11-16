@@ -377,6 +377,20 @@ Result:
 
 ## Troubleshooting
 
+If a collection takes longer than the configured `interval`, the agent logs a
+warning like the following:
+
+```text
+W! [inputs.snmp] Collection took longer than expected; not complete after interval of 1m0s; status: waiting on agent(s): udp://192.168.0.10:161
+```
+
+The `status` suffix lists the agents whose collection was still in progress
+when the warning was logged. This is helpful when multiple agents are
+configured and only one of them is slow or unreachable. Setting `alias` on the
+individual `[[inputs.snmp]]` instance only changes which plugin instance the
+log line is reported for; the agent addresses listed in the status always refer
+to the entries in `agents`.
+
 Check that a numeric field can be translated to a textual field:
 
 ```sh

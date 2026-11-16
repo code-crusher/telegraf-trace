@@ -63,6 +63,16 @@
   If you set `default_service_state`, it now also applies to metrics with
   numeric fields but without thresholds, which used to get `SERVICE_OK`.
   Please check alerts relying on these states.
+
+### Features
+
+- [#19869](https://github.com/influxdata/telegraf/issues/19869) `agent` The
+  `Collection took longer than expected` warning now includes the status
+  reported by the plugin, when the plugin implements the new
+  `telegraf.StatusReporter` interface. `inputs.snmp` implements it and now
+  reports the agents whose collection is still in progress, e.g.
+  `status: waiting on agent(s): udp://192.168.0.10:161`.
+
 ## v1.40.3 [2026-11-02]
 
 ### Bugfixes

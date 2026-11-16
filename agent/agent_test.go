@@ -1,10 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal/clock"
 	"github.com/influxdata/telegraf/models"
 	_ "github.com/influxdata/telegraf/plugins/aggregators/all"
 	_ "github.com/influxdata/telegraf/plugins/inputs/all"
@@ -361,4 +365,148 @@ func TestAggregatorPushWaitsForWindowEndOnEarlyTimer(t *testing.T) {
 func TestAggregatorPushDoesNotWaitOutClockAdjustment(t *testing.T) {
 	pushed, windowEnd := pushAfterWindowShift(t, 2*time.Second)
 	require.True(t, pushed.Before(windowEnd), "pushed at %v, waited for the window end %v", pushed, windowEnd)
+}
+
+type blockingInput struct {
+	started chan struct{}
+	release chan struct{}
+
+	Log telegraf.Logger
+}
+
+func (*blockingInput) SampleConfig() string { return "" }
+
+func (b *blockingInput) Gather(telegraf.Accumulator) error {
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+	<-b.release
+	return nil
+}
+
+type blockingStatusInput struct {
+	blockingInput
+}
+
+func (*blockingStatusInput) Status() string {
+	return "waiting on agent(s): slow-agent:161"
+}
+
+func TestGatherOnceSlowGatherLogsStatus(t *testing.T) {
+	var buf bytes.Buffer
+	backup := log.Writer()
+	log.SetOutput(&buf)
+	defer func() { log.SetOutput(backup) }()
+
+	input := &blockingStatusInput{
+		blockingInput: blockingInput{
+			started: make(chan struct{}, 1),
+			release: make(chan struct{}),
+		},
+	}
+
+	ri := models.NewRunningInput(input, &models.InputConfig{
+		Name:   "test",
+		Filter: models.Filter{},
+	})
+	require.NoError(t, ri.Config.Filter.Compile())
+
+	interval := 100 * time.Millisecond
+	ticker := clock.NewTicker(interval, 0, 0)
+	defer ticker.Stop()
+
+	done := make(chan error, 1)
+	acc := NewAccumulator(ri, make(chan telegraf.Metric, 1))
+	go func() {
+		done <- (&Agent{}).gatherOnce(acc, ri, ticker, interval)
+	}()
+
+	// Wait for the gather to actually start before waiting for the warning
+	select {
+	case <-input.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gather did not start")
+	}
+
+	// The ticker fires once per interval; wait until the warning is logged
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "Collection took longer than expected") {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the warning to be logged, got: %q", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(input.release)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("gatherOnce did not return after the input finished")
+	}
+
+	msg := buf.String()
+	require.Contains(t, msg, "waiting on agent(s): slow-agent:161")
+	require.Contains(t, msg, "[inputs.test]")
+}
+
+func TestGatherOnceSlowGatherWithoutStatus(t *testing.T) {
+	var buf bytes.Buffer
+	backup := log.Writer()
+	log.SetOutput(&buf)
+	defer func() { log.SetOutput(backup) }()
+
+	input := &blockingInput{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+
+	ri := models.NewRunningInput(input, &models.InputConfig{
+		Name:   "test",
+		Filter: models.Filter{},
+	})
+	require.NoError(t, ri.Config.Filter.Compile())
+
+	interval := 100 * time.Millisecond
+	ticker := clock.NewTicker(interval, 0, 0)
+	defer ticker.Stop()
+
+	done := make(chan error, 1)
+	acc := NewAccumulator(ri, make(chan telegraf.Metric, 1))
+	go func() {
+		done <- (&Agent{}).gatherOnce(acc, ri, ticker, interval)
+	}()
+
+	select {
+	case <-input.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gather did not start")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "Collection took longer than expected") {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the warning to be logged, got: %q", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(input.release)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("gatherOnce did not return after the input finished")
+	}
+
+	// The warning should not have the status suffix for plugins that do not
+	// implement the interface.
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "Collection took longer than expected") {
+			require.NotContains(t, line, "status:")
+		}
+	}
 }

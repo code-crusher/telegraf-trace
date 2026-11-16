@@ -584,8 +584,8 @@ func (*Agent) gatherOnce(acc telegraf.Accumulator, input *models.RunningInput, t
 		case err := <-done:
 			return err
 		case <-slowWarning.C:
-			log.Printf("W! [%s] Collection took longer than expected; not complete after interval of %s",
-				input.LogName(), interval)
+			log.Printf("W! [%s] Collection took longer than expected; not complete after interval of %s%s",
+				input.LogName(), interval, slowGatherStatus(input))
 			input.IncrGatherTimeouts()
 		case <-ticker.C:
 			log.Printf("D! [%s] Previous collection has not completed; scheduled collection skipped",
@@ -1158,4 +1158,28 @@ func stopTickers(tickers []*clock.Ticker) {
 	for _, ticker := range tickers {
 		ticker.Stop()
 	}
+}
+
+// slowGatherStatus returns a string describing the status of the given input if
+// it implements telegraf.StatusReporter, for example a list of the agents it is
+// currently waiting on. Otherwise it returns an empty string. It is used to add
+// more context to the "Collection took longer than expected" warning.
+func slowGatherStatus(input *models.RunningInput) (status string) {
+	reporter, ok := input.Input.(telegraf.StatusReporter)
+	if !ok {
+		return ""
+	}
+
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("D! [%s] Reporting the collection status panicked: %v", input.LogName(), err)
+			status = ""
+		}
+	}()
+
+	status = reporter.Status()
+	if status == "" {
+		return ""
+	}
+	return "; status: " + status
 }

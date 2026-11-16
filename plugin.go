@@ -62,3 +62,15 @@ type StatefulPlugin interface {
 type ProbePlugin interface {
 	Probe() error
 }
+
+// StatusReporter is an optional interface for plugins that can report the
+// status of the work that is currently in flight, for example which agents or
+// backends a collection is waiting on.
+//
+// It is used by the agent to give more context when a plugin's collection
+// does not finish within its interval. The returned string should be short and
+// is included in a single line log message. Implementations must be safe to
+// call concurrently with the plugin's Gather method.
+type StatusReporter interface {
+	Status() string
+}

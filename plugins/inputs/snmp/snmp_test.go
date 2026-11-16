@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -811,4 +812,91 @@ func TestGather_hostGosmi(t *testing.T) {
 	require.Len(t, acc.Metrics, 1)
 	m := acc.Metrics[0]
 	require.Equal(t, "baz", m.Tags["host"])
+}
+
+type blockingSNMPConnection struct {
+	*testSNMPConnection
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingSNMPConnection) Get(oids []string) (*gosnmp.SnmpPacket, error) {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return c.testSNMPConnection.Get(oids)
+}
+
+func (c *blockingSNMPConnection) Walk(oid string, wf gosnmp.WalkFunc) error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return c.testSNMPConnection.Walk(oid, wf)
+}
+
+func TestGatherStatusReportsInflightAgents(t *testing.T) {
+	conn := &blockingSNMPConnection{
+		testSNMPConnection: &testSNMPConnection{
+			host:   "tsc",
+			values: map[string]any{},
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	defer func() {
+		select {
+		case <-conn.release:
+		default:
+			close(conn.release)
+		}
+	}()
+
+	s := &Snmp{
+		Agents: []string{"slow-agent:161", "fast-agent:161"},
+		Name:   "mytable",
+		Fields: []snmp.Field{
+			{
+				Name: "myfield",
+				Oid:  ".1.0.0.1.2",
+			},
+		},
+		Log:             testutil.Logger{},
+		connectionCache: []snmp.Connection{conn, &testSNMPConnection{host: "fast", values: map[string]any{".1.0.0.1.2": 1}}},
+	}
+
+	// Before the collection starts, no agents are in-flight
+	require.Empty(t, s.Status())
+
+	acc := &testutil.Accumulator{}
+	gatherDone := make(chan struct{})
+	go func() {
+		defer close(gatherDone)
+		_ = s.Gather(acc)
+	}()
+
+	// Wait for the slow agent to start gathering
+	select {
+	case <-conn.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the agent to start gathering")
+	}
+
+	// The fast agent finishes quickly, so the status must mention the slow
+	// one. It may also still mention the fast one if it hasn't finished yet.
+	deadline := time.Now().Add(5 * time.Second)
+	var status string
+	for {
+		status = s.Status()
+		if strings.Contains(status, "slow-agent:161") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected status to mention the slow agent, got %q", status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Release the slow agent and wait for the collection to finish
+	close(conn.release)
+	<-gatherDone
+	require.Empty(t, s.Status())
 }
