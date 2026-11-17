@@ -147,6 +147,18 @@ func TestConfig_LoadSingleInput(t *testing.T) {
 	require.Equal(t, inputConfig, c.Inputs[0].Config, "Testdata did not produce correct memcached metadata.")
 }
 
+func TestConfig_InputTimeSourceIsAccepted(t *testing.T) {
+	c := config.NewConfig()
+	cfg := []byte(`
+[[inputs.memcached]]
+  servers = ["localhost"]
+  time_source = "collection_start"
+`)
+	require.NoError(t, c.LoadConfigData(cfg, config.EmptySourcePath))
+	require.Len(t, c.Inputs, 1)
+	require.Equal(t, "collection_start", c.Inputs[0].Config.TimeSource)
+}
+
 func TestConfig_InputCollectionJitterExplicitZeroIsSet(t *testing.T) {
 	c := config.NewConfig()
 	cfg := []byte(`

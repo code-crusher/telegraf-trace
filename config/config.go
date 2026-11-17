@@ -1822,7 +1822,7 @@ func (c *Config) missingTomlField(_ reflect.Type, key string) error {
 		"name_override", "name_prefix", "name_suffix", "namedrop", "namedrop_separator", "namepass", "namepass_separator",
 		"order",
 		"pass", "period", "precision",
-		"tagdrop", "tagexclude", "taginclude", "tagpass", "tags", "startup_error_behavior", "labels":
+		"tagdrop", "tagexclude", "taginclude", "tagpass", "tags", "time_source", "startup_error_behavior", "labels":
 
 	// secret store options to ignore
 	case "id":
