@@ -111,6 +111,14 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
   ## By default best effort parsing is off.
   # best_effort = false
 
+  ## Whether to allow CR and LF characters within the message body of
+  ## RFC3164 datagrams (default = false).
+  ## For datagram transports (UDP, unixgram, IP) the datagram boundary delimits
+  ## the message, so embedded newlines are unambiguous. Enable this option to
+  ## keep messages containing CR or LF in the message body instead of
+  ## rejecting them. This setting is ignored for RFC5424.
+  # embedded_newlines = false
+
   ## The RFC standard to use for message parsing
   ## By default RFC5424 is used. RFC3164 only supports UDP transport (no streaming support)
   ## Must be one of "RFC5424", or "RFC3164".

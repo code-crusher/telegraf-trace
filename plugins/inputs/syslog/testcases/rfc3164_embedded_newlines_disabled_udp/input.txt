@@ -1,0 +1,2 @@
+<4>Dec  2 16:31:03 switch.example kernel: i2c transaction error (0x81000000)
+Channel 0x00000001, addr 0x00000058

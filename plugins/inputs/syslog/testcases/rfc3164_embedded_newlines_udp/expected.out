@@ -1,0 +1,1 @@
+syslog,appname=kernel,facility=kern,hostname=switch.example,severity=warning,source=127.0.0.1 facility_code=0i,message="i2c transaction error (0x81000000)\nChannel 0x00000001, addr 0x00000058",severity_code=4i,timestamp=1796229063000000000i 0
