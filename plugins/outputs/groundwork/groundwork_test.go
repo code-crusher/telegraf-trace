@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/logger"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/testutil"
@@ -457,4 +459,383 @@ func TestDefaultServiceState(t *testing.T) {
 			require.Equal(t, tt.expected, service.Status)
 		})
 	}
+}
+
+// testGroundworkServer returns a test server that decodes the incoming
+// request into obj and otherwise acts as a working GroundWork API.
+func testGroundworkServer(t *testing.T, status int, obj *transit.ResourcesWithServicesRequest) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Error(err)
+			return
+		}
+
+		var request transit.ResourcesWithServicesRequest
+		if err = json.Unmarshal(body, &request); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Error(err)
+			return
+		}
+
+		*obj = request
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		if _, err = fmt.Fprintln(w, "OK"); err != nil {
+			t.Error(err)
+		}
+	}))
+}
+
+func testGroundworkClient(server *httptest.Server) Groundwork {
+	return Groundwork{
+		Log:                 testutil.Logger{},
+		Server:              server.URL,
+		AgentID:             defaultTestAgentID,
+		DefaultHost:         defaultHost,
+		DefaultAppType:      defaultAppType,
+		DefaultServiceState: string(transit.ServiceOk),
+		GroupTag:            "group",
+		ResourceTag:         "host",
+		client: clients.GWClient{
+			AppName: "telegraf",
+			AppType: defaultAppType,
+			GWConnection: &clients.GWConnection{
+				HostName: server.URL,
+			},
+		},
+	}
+}
+
+func TestWriteWithRules(t *testing.T) {
+	tests := []struct {
+		name   string
+		rules  []rule
+		metric telegraf.Metric
+		check  func(t *testing.T, obj transit.ResourcesWithServicesRequest)
+	}{
+		{
+			name: "resource from node_name with regex named group",
+			rules: []rule{
+				{Target: "resource", Tag: "node_name", Pattern: `^(?P<short>[^.]+)`, Template: `{{ .Groups.short }}`},
+			},
+			metric: metric.New("test", map[string]string{"node_name": "worker-1.example.com"}, map[string]any{"value": int64(42)}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Resources, 1)
+				require.Equal(t, "worker-1", obj.Resources[0].Name)
+			},
+		},
+		{
+			name: "resource falls back to second rule when first does not match",
+			rules: []rule{
+				{Target: "resource", Tag: "node_name", Pattern: `^(?P<short>[^.]+)\.example\.com$`, Template: `{{ .Groups.short }}`},
+				{Target: "resource", Tag: "host", Pattern: `^(?P<short>[^.]+)`, Template: `{{ .Groups.short }}`},
+			},
+			metric: metric.New("test", map[string]string{"host": "fallback-host.internal"}, map[string]any{"value": int64(42)}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Resources, 1)
+				require.Equal(t, "fallback-host", obj.Resources[0].Name)
+			},
+		},
+		{
+			name: "resource falls back to default_host when no rule matches",
+			rules: []rule{
+				{Target: "resource", Tag: "node_name", Pattern: `^nomatch`},
+			},
+			metric: metric.New("test", nil, map[string]any{"value": int64(42)}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Resources, 1)
+				require.Equal(t, defaultHost, obj.Resources[0].Name)
+			},
+		},
+		{
+			name: "group built from two tags with a template",
+			rules: []rule{
+				{Target: "group", Template: `{{ .Tag "cluster" }}-{{ .Tag "namespace" }}`},
+			},
+			metric: metric.New("test", map[string]string{"cluster": "prod", "namespace": "infra"}, map[string]any{"value": int64(42)}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Groups, 1)
+				require.Equal(t, "prod-infra", obj.Groups[0].GroupName)
+			},
+		},
+		{
+			name: "service built from a field with a regex",
+			rules: []rule{
+				{Target: "service", Field: "unit", Pattern: `^(unit-)?(?P<name>.+)$`, Template: `{{ .Groups.name }}`},
+			},
+			metric: metric.New("test", nil, map[string]any{"value": int64(42), "unit": "unit-nginx"}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Resources, 1)
+				require.Equal(t, "nginx", obj.Resources[0].Services[0].Name)
+			},
+		},
+		{
+			name: "status built from the message field",
+			rules: []rule{
+				{Target: "status", Field: "message", Pattern: `(?i)fatal|critical`, Template: "SERVICE_UNSCHEDULED_CRITICAL"},
+			},
+			metric: metric.New("test", nil, map[string]any{"value": int64(42), "message": "this is a FATAL error"}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Resources, 1)
+				require.Equal(t, transit.ServiceUnscheduledCritical, obj.Resources[0].Services[0].Status)
+			},
+		},
+		{
+			name: "invalid status from a rule falls back to default",
+			rules: []rule{
+				{Target: "status", Field: "message", Template: "NOT_A_STATUS"},
+			},
+			metric: metric.New("test", nil, map[string]any{"value": int64(42), "message": "whatever"}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Resources, 1)
+				require.Equal(t, transit.ServiceOk, obj.Resources[0].Services[0].Status)
+			},
+		},
+		{
+			name: "message built from a tag",
+			rules: []rule{
+				{Target: "message", Tag: "note"},
+			},
+			metric: metric.New("test", map[string]string{"note": "hello from tag"}, map[string]any{"value": int64(42)}, time.Now()),
+			check: func(t *testing.T, obj transit.ResourcesWithServicesRequest) {
+				require.Len(t, obj.Resources, 1)
+				require.Equal(t, "hello from tag", obj.Resources[0].Services[0].LastPluginOutput)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var obj transit.ResourcesWithServicesRequest
+			server := testGroundworkServer(t, http.StatusOK, &obj)
+			defer server.Close()
+
+			i := testGroundworkClient(server)
+			require.NoError(t, validateRules(tt.rules))
+			i.Rules = tt.rules
+
+			require.NoError(t, i.Write([]telegraf.Metric{tt.metric}))
+			tt.check(t, obj)
+		})
+	}
+}
+
+func TestWriteWithRulesSkipsMetrics(t *testing.T) {
+	var obj transit.ResourcesWithServicesRequest
+	server := testGroundworkServer(t, http.StatusOK, &obj)
+	defer server.Close()
+
+	i := testGroundworkClient(server)
+	i.Rules = []rule{
+		{Target: "skip", Tag: "kubernetes_namespace", Pattern: "^kube-"},
+	}
+	require.NoError(t, validateRules(i.Rules))
+
+	skipped := testutil.TestMetric(1, "skipped")
+	skipped.AddTag("kubernetes_namespace", "kube-system")
+	kept := testutil.TestMetric(2, "kept")
+	kept.AddTag("kubernetes_namespace", "default")
+
+	require.NoError(t, i.Write([]telegraf.Metric{skipped, kept}))
+
+	// Only the kept metric is sent.
+	require.Len(t, obj.Resources, 1)
+	require.Len(t, obj.Resources[0].Services, 1)
+	require.Equal(t, "kept", obj.Resources[0].Services[0].Name)
+}
+
+func TestWriteWithAllMetricsSkipped(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	i := testGroundworkClient(server)
+	i.Rules = []rule{
+		{Target: "skip", Tag: "secret", Pattern: ".+"},
+	}
+	require.NoError(t, validateRules(i.Rules))
+	metric := testutil.TestMetric(1, "test")
+	metric.AddTag("secret", "yes")
+
+	// All metrics are skipped, so the server must not be called and the
+	// batch is considered written.
+	require.NoError(t, i.Write([]telegraf.Metric{metric}))
+	require.False(t, called)
+}
+
+func TestWriteWithSkippedMetricsAndFailedSend(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	i := testGroundworkClient(server)
+	i.Rules = []rule{
+		{Target: "skip", Tag: "secret", Pattern: ".+"},
+	}
+	require.NoError(t, validateRules(i.Rules))
+	skipped := testutil.TestMetric(1, "skipped")
+	skipped.AddTag("secret", "yes")
+	kept := testutil.TestMetric(2, "kept")
+
+	err := i.Write([]telegraf.Metric{skipped, kept})
+	var partial *internal.PartialWriteError
+	require.ErrorAs(t, err, &partial)
+	// The skipped metric is considered handled, the kept metric stays in
+	// the buffer to be retried.
+	require.Equal(t, []int{0}, partial.MetricsAccept)
+	require.Empty(t, partial.MetricsReject)
+}
+
+func TestWriteWithRuleSourceNotSentAsProperty(t *testing.T) {
+	var obj transit.ResourcesWithServicesRequest
+	server := testGroundworkServer(t, http.StatusOK, &obj)
+	defer server.Close()
+
+	i := testGroundworkClient(server)
+	i.Rules = []rule{
+		{Target: "resource", Tag: "node_name"},
+		{Target: "status", Field: "severity", Template: "SERVICE_WARNING"},
+	}
+	require.NoError(t, validateRules(i.Rules))
+	metric := testutil.TestMetric(1.0, "test")
+	metric.AddTag("node_name", "worker-1")
+	metric.AddTag("facility", "FACILITY")
+	metric.AddField("severity", "crit")
+	metric.AddField("load", 0.5)
+
+	require.NoError(t, i.Write([]telegraf.Metric{metric}))
+
+	svc := obj.Resources[0].Services[0]
+	// The rule source tag must not be sent as property, the numeric field
+	// used as rule source must still be sent as metric.
+	_, ok := svc.Properties["node_name"]
+	require.False(t, ok)
+	_, ok = svc.Properties["facility"]
+	require.True(t, ok)
+	require.Len(t, svc.Metrics, 2)
+	names := []string{svc.Metrics[0].MetricName, svc.Metrics[1].MetricName}
+	require.ElementsMatch(t, []string{"value", "load"}, names)
+}
+
+func TestValidateRules(t *testing.T) {
+	tests := []struct {
+		name    string
+		rules   []rule
+		wantErr string
+	}{
+		{
+			name:  "valid rule with tag and pattern",
+			rules: []rule{{Target: "resource", Tag: "host", Pattern: ".*"}},
+		},
+		{
+			name:  "valid rule with template only",
+			rules: []rule{{Target: "group", Template: `{{ .Tag "cluster" }}`}},
+		},
+		{
+			name:  "valid rule with field only",
+			rules: []rule{{Target: "message", Field: "message"}},
+		},
+		{
+			name:    "invalid target",
+			rules:   []rule{{Target: "host", Tag: "host"}},
+			wantErr: "invalid target",
+		},
+		{
+			name:    "tag and field are mutually exclusive",
+			rules:   []rule{{Target: "resource", Tag: "a", Field: "b"}},
+			wantErr: "only one of",
+		},
+		{
+			name:    "pattern requires a source",
+			rules:   []rule{{Target: "resource", Pattern: ".*"}},
+			wantErr: "\"pattern\" requires",
+		},
+		{
+			name:    "rule without source and template",
+			rules:   []rule{{Target: "resource"}},
+			wantErr: "at least one of",
+		},
+		{
+			name:    "invalid pattern",
+			rules:   []rule{{Target: "resource", Tag: "host", Pattern: "["}},
+			wantErr: "invalid pattern",
+		},
+		{
+			name:    "invalid template",
+			rules:   []rule{{Target: "resource", Tag: "host", Template: "{{ .Nope"}},
+			wantErr: "invalid template",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRules(tt.rules)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestSampleConfig(t *testing.T) {
+	// The sample config is embedded into the README and
+	// must stay loadable by the plugin.
+	conf := config.NewConfig()
+	require.NoError(t, conf.LoadConfig("sample.conf"))
+	require.Len(t, conf.Outputs, 1)
+	output, ok := conf.Outputs[0].Output.(*Groundwork)
+	require.True(t, ok)
+	require.Empty(t, output.Rules) // all the rule examples are commented out
+
+	// The example rules shown in the sample config must decode correctly
+	// once uncommented
+	example := `
+[[outputs.groundwork]]
+  url = "https://groundwork.example.com"
+  agent_id = "` + defaultTestAgentID + `"
+  username = "u"
+  password = "p"
+
+  [[outputs.groundwork.rules]]
+    target = "resource"
+    tag = "node_name"
+
+  [[outputs.groundwork.rules]]
+    target = "group"
+    template = '{{ .Tag "cluster" }}-{{ .Tag "namespace" }}'
+
+  [[outputs.groundwork.rules]]
+    target = "status"
+    field = "message"
+    pattern = "(?i)fatal|critical"
+    template = "SERVICE_UNSCHEDULED_CRITICAL"
+
+  [[outputs.groundwork.rules]]
+    target = "skip"
+    tag = "secret"
+`
+	f, err := os.CreateTemp(t.TempDir(), "*.conf")
+	require.NoError(t, err)
+	_, err = f.WriteString(example)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	conf2 := config.NewConfig()
+	require.NoError(t, conf2.LoadConfig(f.Name()))
+	require.Len(t, conf2.Outputs, 1)
+	output2, ok := conf2.Outputs[0].Output.(*Groundwork)
+	require.True(t, ok)
+	require.Len(t, output2.Rules, 4)
+	require.NoError(t, validateRules(output2.Rules))
 }

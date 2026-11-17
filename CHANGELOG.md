@@ -63,6 +63,17 @@
   If you set `default_service_state`, it now also applies to metrics with
   numeric fields but without thresholds, which used to get `SERVICE_OK`.
   Please check alerts relying on these states.
+
+### Features
+
+- [#19865](https://github.com/influxdata/telegraf/issues/19865) `outputs.groundwork`
+  accepts a `rules` option to build the `resource`, `group`, `service`,
+  `status` and `message` values from the metric's tags and fields using
+  regular expressions and Go templates instead of only the fixed tag or field
+  names. Rules are evaluated in order with the first match winning and support
+  ordered fallbacks; a `skip` target drops metrics for this output only
+  without affecting other outputs.
+
 ## v1.40.3 [2026-11-02]
 
 ### Bugfixes

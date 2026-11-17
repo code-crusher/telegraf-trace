@@ -18,6 +18,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/common/slog"
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
@@ -31,17 +32,21 @@ type metricMeta struct {
 }
 
 type Groundwork struct {
-	Server              string          `toml:"url"`
-	AgentID             string          `toml:"agent_id"`
-	Username            config.Secret   `toml:"username"`
-	Password            config.Secret   `toml:"password"`
-	DefaultAppType      string          `toml:"default_app_type"`
-	DefaultHost         string          `toml:"default_host"`
-	DefaultServiceState string          `toml:"default_service_state"`
-	GroupTag            string          `toml:"group_tag"`
-	ResourceTag         string          `toml:"resource_tag"`
-	Log                 telegraf.Logger `toml:"-"`
-	client              clients.GWClient
+	Server              string        `toml:"url"`
+	AgentID             string        `toml:"agent_id"`
+	Username            config.Secret `toml:"username"`
+	Password            config.Secret `toml:"password"`
+	DefaultAppType      string        `toml:"default_app_type"`
+	DefaultHost         string        `toml:"default_host"`
+	DefaultServiceState string        `toml:"default_service_state"`
+	GroupTag            string        `toml:"group_tag"`
+	ResourceTag         string        `toml:"resource_tag"`
+	// Rules build the values for the resource, group, service, status and message
+	// from the metric instead of reading them from fixed tags or fields, and
+	// allow skipping metrics for this output only.
+	Rules  []rule          `toml:"rules"`
+	Log    telegraf.Logger `toml:"-"`
+	client clients.GWClient
 }
 
 func (*Groundwork) SampleConfig() string {
@@ -72,6 +77,9 @@ func (g *Groundwork) Init() error {
 	}
 	if !validStatus(g.DefaultServiceState) {
 		return errors.New(`invalid "default_service_state" provided`)
+	}
+	if err := validateRules(g.Rules); err != nil {
+		return err
 	}
 
 	username, err := g.Username.Get()
@@ -119,9 +127,29 @@ func (g *Groundwork) Close() error {
 }
 
 func (g *Groundwork) Write(metrics []telegraf.Metric) error {
+	// Unwrap tracking metrics as the rules and templates require access to the
+	// underlying metric. The indices of the slice are kept aligned with the
+	// input batch as reported in the partial write error.
+	unwrapped := make([]telegraf.Metric, 0, len(metrics))
+	for _, metric := range metrics {
+		if wm, ok := metric.(telegraf.UnwrappableMetric); ok {
+			metric = wm.Unwrap()
+		}
+		unwrapped = append(unwrapped, metric)
+	}
+
 	groupMap := make(map[string][]transit.ResourceRef)
 	resourceToServicesMap := make(map[string][]transit.MonitoredService)
-	for _, metric := range metrics {
+	skipped := make([]int, 0)
+	sent := 0
+	for i, metric := range unwrapped {
+		if g.skipMetric(metric) {
+			g.Log.Debugf("skipping metric %q by rule", metric.Name())
+			skipped = append(skipped, i)
+			continue
+		}
+		sent++
+
 		meta, service := g.parseMetric(metric)
 		resource := meta.resource
 		resourceToServicesMap[resource] = append(resourceToServicesMap[resource], *service)
@@ -139,6 +167,13 @@ func (g *Groundwork) Write(metrics []telegraf.Metric) error {
 				groupMap[group] = []transit.ResourceRef{resRef}
 			}
 		}
+	}
+
+	if sent == 0 {
+		// Everything has been skipped, nothing to send. The batch is
+		// considered handled so the skipped metrics are not retried.
+		g.Log.Debugf("skipped all %d metrics by rule, not sending anything", len(skipped))
+		return nil
 	}
 
 	groups := make([]transit.ResourceGroup, 0, len(groupMap))
@@ -183,10 +218,31 @@ func (g *Groundwork) Write(metrics []telegraf.Metric) error {
 
 	_, err = g.client.SendResourcesWithMetrics(context.Background(), requestJSON)
 	if err != nil {
-		return fmt.Errorf("error while sending: %w", err)
+		if len(skipped) == 0 {
+			return fmt.Errorf("error while sending: %w", err)
+		}
+		// The skipped metrics are considered handled and must not be
+		// retried, keep the rest of the batch for the next write.
+		return &internal.PartialWriteError{
+			Err:           fmt.Errorf("error while sending: %w", err),
+			MetricsAccept: skipped,
+		}
 	}
 
 	return nil
+}
+
+// skipMetric reports whether the metric matches a skip rule.
+func (g *Groundwork) skipMetric(metric telegraf.Metric) bool {
+	for i := range g.Rules {
+		if g.Rules[i].Target != ruleTargetSkip {
+			continue
+		}
+		if _, ok := g.evalRule(&g.Rules[i], metric); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func init() {
@@ -203,14 +259,23 @@ func init() {
 
 func (g *Groundwork) parseMetric(metric telegraf.Metric) (metricMeta, *transit.MonitoredService) {
 	group, _ := metric.GetTag(g.GroupTag)
+	if v, ok := g.ruleValue(metric, ruleTargetGroup); ok {
+		group = v
+	}
 
 	resource := g.DefaultHost
 	if v, ok := metric.GetTag(g.ResourceTag); ok {
 		resource = v
 	}
+	if v, ok := g.ruleValue(metric, ruleTargetResource); ok {
+		resource = v
+	}
 
 	service := metric.Name()
 	if v, ok := metric.GetTag("service"); ok {
+		service = v
+	}
+	if v, ok := g.ruleValue(metric, ruleTargetService); ok {
 		service = v
 	}
 
@@ -234,7 +299,12 @@ func (g *Groundwork) parseMetric(metric telegraf.Metric) (metricMeta, *transit.M
 		Metrics: nil,
 	}
 
-	knownKey := func(t string) bool {
+	ruleTags, ruleFields := ruleSourceKeys(g.Rules)
+
+	// Tags and string-typed fields used as the source of a rule are not sent
+	// as properties or metrics, just like the fixed tags above. Numeric
+	// fields used as the source of a rule are still sent as metrics.
+	knownTagKey := func(t string) bool {
 		if strings.HasSuffix(t, "_cr") ||
 			strings.HasSuffix(t, "_wn") ||
 			t == "critical" ||
@@ -244,21 +314,34 @@ func (g *Groundwork) parseMetric(metric telegraf.Metric) (metricMeta, *transit.M
 			t == "service" ||
 			t == "status" ||
 			t == "message" ||
-			t == "unitType" {
+			t == "unitType" ||
+			ruleTags[t] {
 			return true
+		}
+		return false
+	}
+	knownFieldKey := func(t string, v any) bool {
+		if knownTagKey(t) {
+			return true
+		}
+		if ruleFields[t] {
+			switch v.(type) {
+			case string, []byte:
+				return true
+			}
 		}
 		return false
 	}
 
 	for _, tag := range metric.TagList() {
-		if knownKey(tag.Key) {
+		if knownTagKey(tag.Key) {
 			continue
 		}
 		serviceObject.Properties[tag.Key] = *transit.NewTypedValue(tag.Value)
 	}
 
 	for _, field := range metric.FieldList() {
-		if knownKey(field.Key) {
+		if knownFieldKey(field.Key, field.Value) {
 			continue
 		}
 
@@ -326,7 +409,9 @@ func (g *Groundwork) parseMetric(metric telegraf.Metric) (metricMeta, *transit.M
 		})
 	}
 
-	if m, ok := metric.GetTag("message"); ok {
+	if m, ok := g.ruleValue(metric, ruleTargetMessage); ok {
+		serviceObject.LastPluginOutput = strings.ToValidUTF8(m, "?")
+	} else if m, ok := metric.GetTag("message"); ok {
 		serviceObject.LastPluginOutput = strings.ToValidUTF8(m, "?")
 	} else if m, ok := metric.GetField("message"); ok {
 		switch m := m.(type) {
@@ -340,6 +425,10 @@ func (g *Groundwork) parseMetric(metric telegraf.Metric) (metricMeta, *transit.M
 	}
 
 	func() {
+		if s, ok := g.ruleStatusValue(metric); ok {
+			serviceObject.Status = transit.MonitorStatus(s)
+			return
+		}
 		if s, ok := metric.GetTag("status"); ok && validStatus(s) {
 			serviceObject.Status = transit.MonitorStatus(s)
 			return
