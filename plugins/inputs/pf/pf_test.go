@@ -4,9 +4,11 @@ import (
 	"log"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/influxdata/telegraf/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 type measurementResult struct {
@@ -268,6 +270,74 @@ Counters
 				}
 				n++
 			}
+		})
+	}
+}
+
+func TestPfMeasurementsIndentation(t *testing.T) {
+	// pfctl may indent the state-table and counter fields differently depending
+	// on the platform or version, so make sure the parser accepts any leading
+	// whitespace. See https://github.com/influxdata/telegraf/issues/19780.
+	testCases := []struct {
+		name   string
+		indent string
+	}{
+		{"single-space", " "},
+		{"two-spaces", "  "},
+		{"four-spaces", "    "},
+		{"tab", "\t"},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			var b strings.Builder
+			b.WriteString("Status: Enabled for 0 days 00:26:05           Debug: Urgent\n\n")
+			b.WriteString("State Table                          Total             Rate\n")
+			b.WriteString(tt.indent + "current entries                      250\n")
+			b.WriteString(tt.indent + "searches                        92810970         1789.5/s\n")
+			b.WriteString(tt.indent + "inserts                            64126            1.2/s\n")
+			b.WriteString(tt.indent + "removals                           63876            1.2/s\n")
+			b.WriteString("Counters\n")
+			b.WriteString(tt.indent + "match                          473002784           33.8/s\n")
+			b.WriteString(tt.indent + "bad-offset                             0            0.0/s\n")
+			b.WriteString(tt.indent + "fragment                            2729            0.0/s\n")
+			b.WriteString(tt.indent + "short                                107            0.0/s\n")
+			b.WriteString(tt.indent + "normalize                           1685            0.0/s\n")
+			b.WriteString(tt.indent + "memory                               101            0.0/s\n")
+			b.WriteString(tt.indent + "bad-timestamp                          0            0.0/s\n")
+			b.WriteString(tt.indent + "congestion                             0            0.0/s\n")
+			b.WriteString(tt.indent + "ip-option                         152301            0.0/s\n")
+			b.WriteString(tt.indent + "proto-cksum                          108            0.0/s\n")
+			b.WriteString(tt.indent + "state-mismatch                     24393            0.0/s\n")
+			b.WriteString(tt.indent + "state-insert                          92            0.0/s\n")
+			b.WriteString(tt.indent + "state-limit                            0            0.0/s\n")
+			b.WriteString(tt.indent + "src-limit                              0            0.0/s\n")
+			b.WriteString(tt.indent + "synproxy                               0            0.0/s\n")
+
+			acc := new(testutil.Accumulator)
+			require.NoError(t, parsePfctlOutput(b.String(), acc))
+			require.Len(t, acc.Metrics, 1)
+			require.Equal(t, map[string]any{
+				"entries":        int64(250),
+				"searches":       int64(92810970),
+				"inserts":        int64(64126),
+				"removals":       int64(63876),
+				"match":          int64(473002784),
+				"bad-offset":     int64(0),
+				"fragment":       int64(2729),
+				"short":          int64(107),
+				"normalize":      int64(1685),
+				"memory":         int64(101),
+				"bad-timestamp":  int64(0),
+				"congestion":     int64(0),
+				"ip-option":      int64(152301),
+				"proto-cksum":    int64(108),
+				"state-mismatch": int64(24393),
+				"state-insert":   int64(92),
+				"state-limit":    int64(0),
+				"src-limit":      int64(0),
+				"synproxy":       int64(0),
+			}, acc.Metrics[0].Fields)
 		})
 	}
 }

@@ -21,8 +21,8 @@ var sampleConfig string
 var (
 	errParseHeader     = fmt.Errorf("cannot find header in %s output", pfctlCommand)
 	anyTableHeaderRE   = regexp.MustCompile("^[A-Z]")
-	stateTableRE       = regexp.MustCompile(`^  (.*?)\s+(\d+)`)
-	counterTableRE     = regexp.MustCompile(`^  (.*?)\s+(\d+)`)
+	stateTableRE       = regexp.MustCompile(`^\s+(.*?)\s+(\d+)`)
+	counterTableRE     = regexp.MustCompile(`^\s+(.*?)\s+(\d+)`)
 	execLookPath       = exec.LookPath
 	execCommand        = exec.Command
 	pfctlOutputStanzas = []*pfctlOutputStanza{
