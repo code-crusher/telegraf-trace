@@ -5,10 +5,15 @@ package zfs
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/shirou/gopsutil/v4/host"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
@@ -40,10 +45,25 @@ type poolInfo struct {
 	version    metricsVersion
 }
 
-type helper struct{} //nolint:unused // not used for "linux" OS, needed for Zfs struct
+// helper contains the Linux specific plugin state
+type helper struct {
+	// Function to determine the boot time of the machine, replaceable for
+	// testing purposes
+	bootTime func() (uint64, error)
+
+	// State of the txg collection to persist across Telegraf restarts
+	txgs txgState
+
+	// Mutex to guard the txg state
+	txgMutex sync.Mutex
+}
 
 func (z *Zfs) Init() error {
 	// Set defaults
+	if z.bootTime == nil {
+		z.bootTime = host.BootTime
+	}
+
 	if z.KstatPath == "" {
 		z.KstatPath = "/proc/spl/kstat/zfs"
 	}
@@ -92,6 +112,12 @@ func (z *Zfs) Gather(acc telegraf.Accumulator) error {
 			if err := z.gatherPoolStats(pool, acc); err != nil {
 				return err
 			}
+		}
+	}
+
+	if len(z.TxgPools) > 0 {
+		if err := z.gatherTxgStats(acc); err != nil {
+			return err
 		}
 	}
 
@@ -328,6 +354,205 @@ func (z *Zfs) processProcFile(lines []string) (map[string]any, error) {
 	}
 
 	return data, nil
+}
+
+// Transaction group (txg) statistics.
+//
+// For each pool the file /proc/spl/kstat/zfs/<pool>/txgs contains a rolling
+// history of the latest transaction groups, ordered by their ID. Each row
+// describes a single transaction group, where the state column is one of
+// "B" (birth), "O" (open), "Q" (quiesced), "W" (waiting for sync),
+// "S" (synced) or "C" (committed). Only "C" transactions are complete, the
+// trailing row(s) of the file belong to transaction groups that are not yet
+// committed and are still subject to change.
+//
+// As transaction groups are committed strictly in order, only rows with a
+// state of "C" are collected and each row is emitted only once by keeping
+// track of the last collected transaction-group ID per pool.
+//
+// The birth column contains the transaction group's birth time in
+// nanoseconds since boot, which is converted to a wall-clock time using the
+// current boot time and used as the metric timestamp.
+const (
+	txgStateCommitted = "C"
+
+	// Column names of the txgs file required for processing the rows. The
+	// parser is driven by the header line instead of relying on a fixed
+	// column order to be robust against future format additions.
+	txgColumnID    = "txg"
+	txgColumnBirth = "birth"
+	txgColumnState = "state"
+)
+
+// txgState is the state of the txg collection to persist across Telegraf
+// restarts, so already emitted transaction groups are not collected again.
+type txgState struct {
+	// Boot time (in seconds since the epoch) the last-seen transaction-group
+	// IDs were collected at. A mismatch with the current boot time (e.g.
+	// after a reboot or a pool export/import) invalidates the stored IDs as
+	// the transaction-group numbering restarts in that case.
+	BootTime int64             `json:"boot_time"`
+	LastSeen map[string]uint64 `json:"last_seen"`
+}
+
+func (z *Zfs) gatherTxgStats(acc telegraf.Accumulator) error {
+	// The transaction-group birth times are relative to the boot time of the
+	// machine, so the current boot time is required to derive the metric
+	// timestamp from it.
+	bootTimeFn := z.bootTime
+	if bootTimeFn == nil {
+		bootTimeFn = host.BootTime
+	}
+	bootTime, err := bootTimeFn()
+	if err != nil {
+		return fmt.Errorf("determining boot time failed: %w", err)
+	}
+	bootTimestamp := time.Unix(int64(bootTime), 0)
+
+	z.txgMutex.Lock()
+	defer z.txgMutex.Unlock()
+
+	// Transaction-group IDs are only unique per boot, so discard the stored
+	// IDs if the machine was rebooted since the last collection.
+	if z.txgs.BootTime != bootTimestamp.Unix() {
+		z.txgs.BootTime = bootTimestamp.Unix()
+		z.txgs.LastSeen = make(map[string]uint64, len(z.TxgPools))
+	}
+
+	for _, pool := range z.TxgPools {
+		fn := filepath.Join(z.KstatPath, pool, "txgs")
+		lines, err := internal.ReadLines(fn)
+		if err != nil {
+			z.Log.Warnf("reading txgs file %q failed: %v", fn, err)
+			continue
+		}
+
+		last := z.txgs.LastSeen[pool]
+		newLast, err := processTxgFile(pool, lines, last, bootTimestamp, acc)
+		if err != nil {
+			return fmt.Errorf("collecting txg stats from %q failed: %w", fn, err)
+		}
+		z.txgs.LastSeen[pool] = newLast
+	}
+
+	return nil
+}
+
+// processTxgFile parses the given txgs file and emits all committed
+// transaction groups with an ID larger than the given one. It returns the ID
+// of the last emitted transaction group, which is the given ID if no new
+// transaction groups were found.
+func processTxgFile(
+	pool string,
+	lines []string,
+	last uint64,
+	bootTime time.Time,
+	acc telegraf.Accumulator,
+) (uint64, error) {
+	// Files without a header line do not contain any data to process. This
+	// also covers pools with txg history disabled (zfs_txg_history=0),
+	// where the file only contains the header.
+	if len(lines) < 2 {
+		return last, nil
+	}
+
+	// The header line contains the column names of the data rows. Determine
+	// the position of the individual columns as the file might contain
+	// additional columns in future ZFS versions.
+	header := strings.Fields(lines[0])
+	columns := make(map[string]int, len(header))
+	for i, column := range header {
+		columns[column] = i
+	}
+	idxID, found := columns[txgColumnID]
+	if !found {
+		return last, fmt.Errorf("missing %q column in header %q", txgColumnID, lines[0])
+	}
+	idxBirth, found := columns[txgColumnBirth]
+	if !found {
+		return last, fmt.Errorf("missing %q column in header %q", txgColumnBirth, lines[0])
+	}
+	idxState, found := columns[txgColumnState]
+	if !found {
+		return last, fmt.Errorf("missing %q column in header %q", txgColumnState, lines[0])
+	}
+
+	newLast := last
+	for i, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < len(header) {
+			return newLast, fmt.Errorf("invalid data in line %d: %s", i+2, line)
+		}
+
+		// Only complete transaction groups are collected. Incomplete groups
+		// are at the end of the file and are picked up by a later gather
+		// once they are committed.
+		if fields[idxState] != txgStateCommitted {
+			continue
+		}
+
+		id, err := strconv.ParseUint(fields[idxID], 10, 64)
+		if err != nil {
+			return newLast, fmt.Errorf("parsing txg ID %q in line %d failed: %w", fields[idxID], i+2, err)
+		}
+		if id <= last {
+			continue
+		}
+
+		birth, err := strconv.ParseInt(fields[idxBirth], 10, 64)
+		if err != nil {
+			return newLast, fmt.Errorf("parsing birth time %q in line %d failed: %w", fields[idxBirth], i+2, err)
+		}
+
+		// Emit all remaining columns of the transaction group as fields
+		data := make(map[string]any, len(header))
+		for column, idx := range columns {
+			if idx == idxID || idx == idxBirth || idx == idxState {
+				continue
+			}
+			value, err := strconv.ParseUint(fields[idx], 10, 64)
+			if err != nil {
+				return newLast, fmt.Errorf("parsing field %q with %q in line %d failed: %w",
+					column, fields[idx], i+2, err)
+			}
+			data[column] = value
+		}
+
+		tags := map[string]string{"pool": pool}
+		acc.AddFields("zfs_txg", data, tags, bootTime.Add(time.Duration(birth)*time.Nanosecond))
+		newLast = id
+	}
+
+	return newLast, nil
+}
+
+// GetState returns the txg collection state to persist between Telegraf
+// restarts, so already emitted transaction groups are not collected again.
+func (z *Zfs) GetState() any {
+	z.txgMutex.Lock()
+	defer z.txgMutex.Unlock()
+
+	state := z.txgs
+	state.LastSeen = maps.Clone(z.txgs.LastSeen)
+
+	return state
+}
+
+// SetState restores the txg collection state persisted by a previous run.
+func (z *Zfs) SetState(state any) error {
+	z.txgMutex.Lock()
+	defer z.txgMutex.Unlock()
+
+	txgs, ok := state.(txgState)
+	if !ok {
+		return fmt.Errorf("invalid type %T for txg state", state)
+	}
+	if txgs.LastSeen == nil {
+		txgs.LastSeen = make(map[string]uint64)
+	}
+	z.txgs = txgs
+
+	return nil
 }
 
 func init() {

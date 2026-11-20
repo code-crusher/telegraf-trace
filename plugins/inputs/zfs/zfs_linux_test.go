@@ -3,15 +3,20 @@
 package zfs
 
 import (
+	"encoding/json"
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/parsers/influx"
 	"github.com/influxdata/telegraf/testutil"
@@ -199,6 +204,10 @@ dmu_tx_dirty_delay              4    888
 dmu_tx_dirty_over_max           4    999
 dmu_tx_quota                    4    101010
 `
+
+// Fixed boot time (in seconds since the epoch) used by the testcases to make
+// the txg metric timestamps deterministic
+const testcaseBootTimeSec = 1759000000
 
 const abdstatsContents = `7 1 0x01 21 1008 25476602923533 29223577332204
 name                            type data
@@ -455,6 +464,9 @@ func TestCases(t *testing.T) {
 			plugin := cfg.Inputs[0].Input.(*Zfs)
 			plugin.KstatPath = procPath
 			plugin.Log = testutil.Logger{}
+			// Fix the boot time to make the txg metric timestamps
+			// deterministic, see the "issue_18981" testcase
+			plugin.bootTime = func() (uint64, error) { return testcaseBootTimeSec, nil }
 			require.NoError(t, plugin.Init())
 
 			// Gather and test
@@ -679,5 +691,376 @@ func getPoolMetricsNewFormatV22() map[string]any {
 		"zil_itx_metaslab_slog_bytes":   int64(15),
 		"zil_itx_metaslab_slog_write":   int64(16),
 		"zil_itx_metaslab_slog_alloc":   int64(17),
+	}
+}
+
+// Header line of the txgs files as written by ZFS, the columns are padded
+const txgsHeader = "txg      birth            state ndirty       nread        nwritten     reads    writes   otime        qtime        wtime        stime"
+
+const txgsContents = txgsHeader + `
+285085   1350620773422122 C     9437184      0            3260416      0        129      5119855254   4900         16190        14578801
+285086   1350625893279577 C     10688000     0            5791744      0        205      5119855254   4900         16190        14578801
+285087   1350631013134831 C     4628480      0            3260416      0        129      5119851145   4250         13720        10398410
+285088   1350636293279577 O     0            0            0            0        0        0            0            0            0
+`
+
+const txgsUpdatedContents = txgsHeader + `
+285087   1350631013134831 C     4628480      0            3260416      0        129      5119851145   4250         13720        10398410
+285088   1350636293279577 C     6288384      0            4284416      0        178      5119842484   4620         14190        12761110
+285089   1350641413134831 C     8388608      0            5242880      0        202      5119841428   4710         15200        11761110
+285090   1350646532985976 O     0            0            0            0        0        0            0            0            0
+`
+
+func TestZfsTxgMetrics(t *testing.T) {
+	tmpDir := t.TempDir()
+	testKstatPath := tmpDir + "/telegraf/proc/spl/kstat/zfs"
+	require.NoError(t, os.MkdirAll(testKstatPath, 0750))
+	require.NoError(t, os.MkdirAll(testKstatPath+"/HOME", 0750))
+	require.NoError(t, os.WriteFile(testKstatPath+"/arcstats", []byte(arcstatsContents), 0640))
+	require.NoError(t, os.WriteFile(testKstatPath+"/HOME/txgs", []byte(txgsContents), 0640))
+
+	// Fixed boot time to make the metric timestamps deterministic
+	const bootTimeSec = 1759000000
+	bootTimeFn := func() (uint64, error) { return bootTimeSec, nil }
+
+	// Txg collection is disabled by default
+	z := &Zfs{
+		KstatPath:    testKstatPath,
+		KstatMetrics: []string{"arcstats"},
+		Log:          testutil.Logger{},
+		helper:       helper{bootTime: bootTimeFn},
+	}
+	require.NoError(t, z.Init())
+
+	var acc testutil.Accumulator
+	require.NoError(t, z.Gather(&acc))
+	require.False(t, acc.HasMeasurement("zfs_txg"))
+
+	// Enabling the collection emits all completed transaction groups of the
+	// pool, the incomplete ones are skipped
+	z = &Zfs{
+		KstatPath:    testKstatPath,
+		KstatMetrics: []string{"arcstats"},
+		TxgPools:     []string{"HOME"},
+		Log:          testutil.Logger{},
+		helper:       helper{bootTime: bootTimeFn},
+	}
+	require.NoError(t, z.Init())
+
+	acc = testutil.Accumulator{}
+	require.NoError(t, z.Gather(&acc))
+
+	expected := []telegraf.Metric{
+		metric.New(
+			"zfs_txg",
+			map[string]string{"pool": "HOME"},
+			map[string]any{
+				"ndirty":   uint64(9437184),
+				"nread":    uint64(0),
+				"nwritten": uint64(3260416),
+				"reads":    uint64(0),
+				"writes":   uint64(129),
+				"otime":    uint64(5119855254),
+				"qtime":    uint64(4900),
+				"wtime":    uint64(16190),
+				"stime":    uint64(14578801),
+			},
+			time.Unix(bootTimeSec, 1350620773422122),
+		),
+		metric.New(
+			"zfs_txg",
+			map[string]string{"pool": "HOME"},
+			map[string]any{
+				"ndirty":   uint64(10688000),
+				"nread":    uint64(0),
+				"nwritten": uint64(5791744),
+				"reads":    uint64(0),
+				"writes":   uint64(205),
+				"otime":    uint64(5119855254),
+				"qtime":    uint64(4900),
+				"wtime":    uint64(16190),
+				"stime":    uint64(14578801),
+			},
+			time.Unix(bootTimeSec, 1350625893279577),
+		),
+		metric.New(
+			"zfs_txg",
+			map[string]string{"pool": "HOME"},
+			map[string]any{
+				"ndirty":   uint64(4628480),
+				"nread":    uint64(0),
+				"nwritten": uint64(3260416),
+				"reads":    uint64(0),
+				"writes":   uint64(129),
+				"otime":    uint64(5119851145),
+				"qtime":    uint64(4250),
+				"wtime":    uint64(13720),
+				"stime":    uint64(10398410),
+			},
+			time.Unix(bootTimeSec, 1350631013134831),
+		),
+	}
+	actual := slices.DeleteFunc(acc.GetTelegrafMetrics(), func(m telegraf.Metric) bool {
+		return m.Name() != "zfs_txg"
+	})
+	testutil.RequireMetricsEqual(t, expected, actual)
+
+	// A second gather must not emit the already collected transaction groups
+	acc = testutil.Accumulator{}
+	require.NoError(t, z.Gather(&acc))
+	require.False(t, acc.HasMeasurement("zfs_txg"))
+
+	// Only the new transaction groups of the updated file are emitted
+	require.NoError(t, os.WriteFile(testKstatPath+"/HOME/txgs", []byte(txgsUpdatedContents), 0640))
+	acc = testutil.Accumulator{}
+	require.NoError(t, z.Gather(&acc))
+
+	expected = []telegraf.Metric{
+		metric.New(
+			"zfs_txg",
+			map[string]string{"pool": "HOME"},
+			map[string]any{
+				"ndirty":   uint64(6288384),
+				"nread":    uint64(0),
+				"nwritten": uint64(4284416),
+				"reads":    uint64(0),
+				"writes":   uint64(178),
+				"otime":    uint64(5119842484),
+				"qtime":    uint64(4620),
+				"wtime":    uint64(14190),
+				"stime":    uint64(12761110),
+			},
+			time.Unix(bootTimeSec, 1350636293279577),
+		),
+		metric.New(
+			"zfs_txg",
+			map[string]string{"pool": "HOME"},
+			map[string]any{
+				"ndirty":   uint64(8388608),
+				"nread":    uint64(0),
+				"nwritten": uint64(5242880),
+				"reads":    uint64(0),
+				"writes":   uint64(202),
+				"otime":    uint64(5119841428),
+				"qtime":    uint64(4710),
+				"wtime":    uint64(15200),
+				"stime":    uint64(11761110),
+			},
+			time.Unix(bootTimeSec, 1350641413134831),
+		),
+	}
+	actual = slices.DeleteFunc(acc.GetTelegrafMetrics(), func(m telegraf.Metric) bool {
+		return m.Name() != "zfs_txg"
+	})
+	testutil.RequireMetricsEqual(t, expected, actual)
+}
+
+func TestZfsTxgPoolSelection(t *testing.T) {
+	tmpDir := t.TempDir()
+	testKstatPath := tmpDir + "/telegraf/proc/spl/kstat/zfs"
+	require.NoError(t, os.MkdirAll(testKstatPath, 0750))
+	require.NoError(t, os.WriteFile(testKstatPath+"/arcstats", []byte(arcstatsContents), 0640))
+	for _, pool := range []string{"HOME", "STORAGE", "BACKUP"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(testKstatPath, pool), 0750))
+		require.NoError(t, os.WriteFile(filepath.Join(testKstatPath, pool, "txgs"), []byte(txgsContents), 0640))
+	}
+
+	// Only the configured pools are collected, missing pools are ignored
+	z := &Zfs{
+		KstatPath:    testKstatPath,
+		KstatMetrics: []string{"arcstats"},
+		TxgPools:     []string{"HOME", "STORAGE", "missing"},
+		Log:          testutil.Logger{},
+		helper:       helper{bootTime: func() (uint64, error) { return 1759000000, nil }},
+	}
+	require.NoError(t, z.Init())
+
+	var acc testutil.Accumulator
+	require.NoError(t, z.Gather(&acc))
+
+	// Collect the pools of the emitted transaction groups
+	pools := make(map[string]struct{})
+	for _, m := range acc.GetTelegrafMetrics() {
+		if m.Name() != "zfs_txg" {
+			continue
+		}
+		pools[m.Tags()["pool"]] = struct{}{}
+	}
+	require.ElementsMatch(t, []string{"HOME", "STORAGE"}, slices.Collect(maps.Keys(pools)))
+
+	// Each of the pools emitted the three committed transaction groups once
+	require.Len(t, pools, 2)
+	for _, pool := range []string{"HOME", "STORAGE"} {
+		var count int
+		for _, m := range acc.GetTelegrafMetrics() {
+			if m.Name() == "zfs_txg" && m.Tags()["pool"] == pool {
+				count++
+			}
+		}
+		require.Equal(t, 3, count, "pool %s", pool)
+	}
+}
+
+func TestZfsTxgState(t *testing.T) {
+	const bootTimeSec = 1759000000
+
+	testKstatPath := t.TempDir() + "/telegraf/proc/spl/kstat/zfs"
+	require.NoError(t, os.MkdirAll(filepath.Join(testKstatPath, "HOME"), 0750))
+	require.NoError(t, os.WriteFile(filepath.Join(testKstatPath, "HOME", "txgs"), []byte(txgsContents), 0640))
+
+	// A state restored from a previous run contains the last collected
+	// transaction group of the pool
+	z := &Zfs{
+		KstatPath: testKstatPath,
+		TxgPools:  []string{"HOME"},
+		Log:       testutil.Logger{},
+		helper: helper{
+			bootTime: func() (uint64, error) { return bootTimeSec, nil },
+			txgs: txgState{
+				BootTime: bootTimeSec,
+				LastSeen: map[string]uint64{"HOME": 285087},
+			},
+		},
+	}
+	require.NoError(t, z.Init())
+
+	// The incomplete transaction group of the file is the only one left,
+	// so nothing is emitted and the state is unchanged
+	var acc testutil.Accumulator
+	require.NoError(t, z.Gather(&acc))
+	require.False(t, acc.HasMeasurement("zfs_txg"))
+
+	expected := txgState{
+		BootTime: bootTimeSec,
+		LastSeen: map[string]uint64{"HOME": 285087},
+	}
+	require.Equal(t, expected, z.GetState())
+
+	// A state with a different boot time (i.e. the machine was rebooted since
+	// the last collection) is discarded, as the transaction group numbering
+	// restarts in that case and the stored IDs are meaningless
+	require.NoError(t, z.SetState(txgState{
+		BootTime: bootTimeSec - 100,
+		LastSeen: map[string]uint64{"HOME": 285087},
+	}))
+
+	acc = testutil.Accumulator{}
+	require.NoError(t, z.Gather(&acc))
+
+	// All completed transaction groups are emitted again with their original
+	// timestamps as the boot time changed
+	var count int
+	for _, m := range acc.GetTelegrafMetrics() {
+		if m.Name() != "zfs_txg" {
+			continue
+		}
+		require.Equal(t, "HOME", m.Tags()["pool"])
+		count++
+	}
+	require.Equal(t, 3, count)
+
+	// An invalid state is rejected
+	require.ErrorContains(t, z.SetState("invalid"), "invalid type")
+}
+
+func TestZfsTxgStatePersisterRoundTrip(t *testing.T) {
+	z := &Zfs{
+		Log: testutil.Logger{},
+		helper: helper{
+			txgs: txgState{
+				BootTime: 1759000000,
+				LastSeen: map[string]uint64{"HOME": 285087},
+			},
+		},
+	}
+	require.NoError(t, z.Init())
+
+	// The persister serializes the state returned by GetState and later
+	// unmarshals it into a new instance of the state's type, which is then
+	// set via SetState (see persister.Load and persister.Store)
+	serialized, err := json.Marshal(z.GetState())
+	require.NoError(t, err)
+
+	restored := reflect.New(reflect.TypeOf(z.GetState())).Interface()
+	require.NoError(t, json.Unmarshal(serialized, &restored))
+	require.NoError(t, z.SetState(reflect.ValueOf(restored).Elem().Interface()))
+
+	expected := txgState{
+		BootTime: 1759000000,
+		LastSeen: map[string]uint64{"HOME": 285087},
+	}
+	require.Equal(t, expected, z.GetState())
+}
+
+func TestZfsTxgMissingFile(t *testing.T) {
+	// A pool without a txgs file must not fail the whole gather
+	testKstatPath := t.TempDir() + "/telegraf/proc/spl/kstat/zfs"
+	require.NoError(t, os.MkdirAll(testKstatPath, 0750))
+	require.NoError(t, os.WriteFile(testKstatPath+"/arcstats", []byte(arcstatsContents), 0640))
+
+	z := &Zfs{
+		KstatPath:    testKstatPath,
+		KstatMetrics: []string{"arcstats"},
+		TxgPools:     []string{"missing"},
+		Log:          testutil.Logger{},
+		helper:       helper{bootTime: func() (uint64, error) { return 1759000000, nil }},
+	}
+	require.NoError(t, z.Init())
+
+	var acc testutil.Accumulator
+	require.NoError(t, z.Gather(&acc))
+	require.False(t, acc.HasMeasurement("zfs_txg"))
+	require.True(t, acc.HasMeasurement("zfs"))
+}
+
+func TestZfsTxgInvalidData(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents string
+	}{
+		{
+			name: "missing txg column",
+			contents: "birth            state ndirty\n" +
+				"1350620773422122 C     9437184\n",
+		},
+		{
+			name: "missing birth column",
+			contents: "txg      state ndirty\n" +
+				"285085   C     9437184\n",
+		},
+		{
+			name: "missing state column",
+			contents: "txg      birth            ndirty\n" +
+				"285085   1350620773422122 9437184\n",
+		},
+		{
+			name: "invalid txg ID",
+			contents: "txg      birth            state ndirty\n" +
+				"twenty   1350620773422122 C     9437184\n",
+		},
+		{
+			name: "truncated row",
+			contents: "txg      birth            state ndirty       nread\n" +
+				"285085   1350620773422122 C\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testKstatPath := t.TempDir() + "/telegraf/proc/spl/kstat/zfs"
+			require.NoError(t, os.MkdirAll(filepath.Join(testKstatPath, "HOME"), 0750))
+			require.NoError(t, os.WriteFile(filepath.Join(testKstatPath, "HOME", "txgs"), []byte(tt.contents), 0640))
+
+			z := &Zfs{
+				KstatPath: testKstatPath,
+				TxgPools:  []string{"HOME"},
+				Log:       testutil.Logger{},
+				helper:    helper{bootTime: func() (uint64, error) { return 1759000000, nil }},
+			}
+			require.NoError(t, z.Init())
+
+			var acc testutil.Accumulator
+			require.ErrorContains(t, z.Gather(&acc), "collecting txg stats")
+		})
 	}
 }

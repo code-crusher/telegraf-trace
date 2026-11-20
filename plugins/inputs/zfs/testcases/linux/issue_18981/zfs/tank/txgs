@@ -1,0 +1,3 @@
+txg      birth            state ndirty       nread        nwritten     reads    writes   otime        qtime        wtime        stime       
+285185   1351138043043083 C     6496768      0            4153344      0        163      5119859524   4320         13960        11793500   
+285186   1351143162902607 O     0            0            0            0        0        0            0            0            0           

@@ -16,6 +16,7 @@ type Zfs struct {
 	PoolMetrics    bool            `toml:"poolMetrics"`
 	DatasetMetrics bool            `toml:"datasetMetrics"`
 	UseNativeTypes bool            `toml:"useNativeTypes"`
+	TxgPools       []string        `toml:"txgPools"`
 	Log            telegraf.Logger `toml:"-"`
 
 	helper //nolint:unused // for OS-specific usage
