@@ -2,6 +2,7 @@ package logstash
 
 import (
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,10 +16,20 @@ import (
 
 var logstashTest = newLogstash()
 
+// mergeTags returns the union of the given tag maps for test assertions.
+func mergeTags(tags ...map[string]string) map[string]string {
+	merged := make(map[string]string)
+	for _, tagMap := range tags {
+		maps.Copy(merged, tagMap)
+	}
+	return merged
+}
+
 var (
 	logstash5accPipelineStats  testutil.Accumulator
 	logstash6accPipelinesStats testutil.Accumulator
 	logstash7accPipelinesStats testutil.Accumulator
+	logstash8accPipelinesStats testutil.Accumulator
 	logstash5accProcessStats   testutil.Accumulator
 	logstash6accProcessStats   testutil.Accumulator
 	logstash5accJVMStats       testutil.Accumulator
@@ -220,6 +231,28 @@ func Test_Logstash5GatherPipelineStats(test *testing.T) {
 			"plugin_type":  string("output"),
 		},
 	)
+
+	// The "reloads" section is collected by all versions but was not
+	// exposed before.
+	logstash5accPipelineStats.AssertContainsTaggedFields(
+		test,
+		"logstash_reloads",
+		map[string]any{
+			"successes": float64(0),
+			"failures":  float64(0),
+		},
+		map[string]string{
+			"node_id":      string("a360d8cf-6289-429d-8419-6145e324b574"),
+			"node_name":    string("node-5-test"),
+			"source":       string("node-5"),
+			"node_version": string("5.3.0"),
+		},
+	)
+
+	// Logstash 5 does not expose the worker configuration or the flow
+	// statistics, so those measurements must not be emitted.
+	logstash5accPipelineStats.AssertDoesNotContainMeasurement(test, "logstash_pipeline")
+	logstash5accPipelineStats.AssertDoesNotContainMeasurement(test, "logstash_flow")
 }
 
 func Test_Logstash6GatherPipelinesStats(test *testing.T) {
@@ -566,6 +599,28 @@ func Test_Logstash6GatherPipelinesStats(test *testing.T) {
 			"queue_type":   string("persisted"),
 		},
 	)
+
+	// The "reloads" section is collected by all versions but was not
+	// exposed before. Logstash 6 does not expose the worker configuration
+	// or the flow statistics, so those measurements must not be emitted.
+	logstash6accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_reloads",
+		map[string]any{
+			"successes": float64(0),
+			"failures":  float64(0),
+		},
+		map[string]string{
+			"node_id":      string("3044f675-21ce-4335-898a-8408aa678245"),
+			"node_name":    string("node-6-test"),
+			"source":       string("node-6"),
+			"node_version": string("6.4.2"),
+			"pipeline":     string("main"),
+		},
+	)
+
+	logstash6accPipelinesStats.AssertDoesNotContainMeasurement(test, "logstash_pipeline")
+	logstash6accPipelinesStats.AssertDoesNotContainMeasurement(test, "logstash_flow")
 }
 
 func Test_Logstash5GatherJVMStats(test *testing.T) {
@@ -826,5 +881,160 @@ func Test_Logstash7GatherPipelinesQueueStats(test *testing.T) {
 			"pipeline":     string("infra"),
 			"queue_type":   string("persisted"),
 		},
+	)
+
+	// The "reloads" section is collected by all versions but was not
+	// exposed before.
+	logstash7accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_reloads",
+		map[string]any{
+			"successes": float64(4),
+			"failures":  float64(0),
+		},
+		map[string]string{
+			"node_id":      string("28580380-ad2c-4032-934b-76359125edca"),
+			"node_name":    string("HOST01.local"),
+			"source":       string("HOST01.local"),
+			"node_version": string("7.4.2"),
+			"pipeline":     string("infra"),
+		},
+	)
+}
+
+func Test_Logstash8GatherPipelinesStats(test *testing.T) {
+	fakeServer := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(writer, "%s", string(logstash8PipelinesJSON)); err != nil {
+			writer.WriteHeader(http.StatusInternalServerError)
+			test.Error(err)
+			return
+		}
+	}))
+	requestURL, err := url.Parse(logstashTest.URL)
+	require.NoErrorf(test, err, "Can't connect to: %s", logstashTest.URL)
+	fakeServer.Listener, err = net.Listen("tcp", fmt.Sprintf("%s:%s", requestURL.Hostname(), requestURL.Port()))
+	require.NoError(test, err)
+	fakeServer.Start()
+	defer fakeServer.Close()
+
+	if logstashTest.client == nil {
+		client, err := logstashTest.createHTTPClient()
+		require.NoError(test, err, "Can't createHTTPClient")
+		logstashTest.client = client
+	}
+
+	err = logstashTest.gatherPipelinesStats(logstashTest.URL+pipelinesStatsNode, &logstash8accPipelinesStats)
+	require.NoError(test, err, "Can't gather Pipeline stats")
+
+	pipelineTags := map[string]string{
+		"node_id":      string("4793d0bd-2b46-431f-8f10-7de3f743c5f8"),
+		"node_name":    string("node-8-test"),
+		"source":       string("node-8"),
+		"node_version": string("8.11.4"),
+		"pipeline":     string("main"),
+	}
+
+	// The per-pipeline "pipeline" section exposes the worker configuration.
+	logstash8accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_pipeline",
+		map[string]any{
+			"workers":     float64(4),
+			"batch_size":  float64(125),
+			"batch_delay": float64(50),
+		},
+		pipelineTags,
+	)
+
+	// The per-pipeline "flow" section exposes throughput and worker
+	// utilization statistics.
+	logstash8accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_flow",
+		map[string]any{
+			"input_throughput_current":         float64(594.3),
+			"input_throughput_last_1_minute":   float64(588.1),
+			"input_throughput_lifetime":        float64(575.4),
+			"filter_throughput_current":        float64(594.6),
+			"filter_throughput_last_1_minute":  float64(587.9),
+			"filter_throughput_lifetime":       float64(575.1),
+			"output_throughput_current":        float64(595.2),
+			"output_throughput_last_1_minute":  float64(588.3),
+			"output_throughput_lifetime":       float64(575.1),
+			"queue_backpressure_current":       float64(0.0214),
+			"queue_backpressure_last_1_minute": float64(0.0185),
+			"queue_backpressure_lifetime":      float64(0.0349),
+			"worker_concurrency_current":       float64(0.941),
+			"worker_concurrency_last_1_minute": float64(0.937),
+			"worker_concurrency_lifetime":      float64(0.9709),
+			"worker_utilization_current":       float64(93.092),
+			"worker_utilization_last_1_minute": float64(93.495),
+			"worker_utilization_lifetime":      float64(92.187),
+		},
+		pipelineTags,
+	)
+
+	logstash8accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_reloads",
+		map[string]any{
+			"successes": float64(4),
+			"failures":  float64(2),
+		},
+		pipelineTags,
+	)
+
+	// The per-plugin "flow" section is exposed as fields prefixed with
+	// "flow" on the existing plugin metrics.
+	logstash8accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_plugins",
+		map[string]any{
+			"flow_throughput_current":       float64(594.3),
+			"flow_throughput_last_1_minute": float64(588.1),
+			"flow_throughput_lifetime":      float64(575.4),
+		},
+		mergeTags(pipelineTags, map[string]string{
+			"plugin_name": string("beats"),
+			"plugin_id":   string("8526dc80bc2257ab08f96018f96b0c68dd03abc5695bb22fb9e96339a8dfb4f86"),
+			"plugin_type": string("input"),
+		}),
+	)
+
+	logstash8accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_plugins",
+		map[string]any{
+			"flow_worker_utilization_current":            float64(16.71),
+			"flow_worker_utilization_last_1_minute":      float64(16.4),
+			"flow_worker_utilization_lifetime":           float64(15.27),
+			"flow_worker_millis_per_event_current":       float64(0.2829),
+			"flow_worker_millis_per_event_last_1_minute": float64(0.2815),
+			"flow_worker_millis_per_event_lifetime":      float64(0.2585),
+		},
+		mergeTags(pipelineTags, map[string]string{
+			"plugin_name": string("date"),
+			"plugin_id":   string("9e8297a6ee7b61864f77853317dccde83d29952ef869010c385dcfc9064ab8b8"),
+			"plugin_type": string("filter"),
+		}),
+	)
+
+	logstash8accPipelinesStats.AssertContainsTaggedFields(
+		test,
+		"logstash_plugins",
+		map[string]any{
+			"flow_worker_utilization_current":            float64(75.34),
+			"flow_worker_utilization_last_1_minute":      float64(75.61),
+			"flow_worker_utilization_lifetime":           float64(76.01),
+			"flow_worker_millis_per_event_current":       float64(1.276),
+			"flow_worker_millis_per_event_last_1_minute": float64(1.281),
+			"flow_worker_millis_per_event_lifetime":      float64(1.287),
+		},
+		mergeTags(pipelineTags, map[string]string{
+			"plugin_name": string("elasticsearch"),
+			"plugin_id":   string("38967f09bbd2647a95aa00702b6b557bdbbab31da6a04f991d38abe5629779e3"),
+			"plugin_type": string("output"),
+		}),
 	)
 }

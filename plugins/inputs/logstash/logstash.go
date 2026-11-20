@@ -81,15 +81,18 @@ type pipelineStats struct {
 }
 
 type pipeline struct {
-	Events  any             `json:"events"`
-	Plugins pipelinePlugins `json:"plugins"`
-	Reloads any             `json:"reloads"`
-	Queue   pipelineQueue   `json:"queue"`
+	Events   any             `json:"events"`
+	Flow     any             `json:"flow"`
+	Pipeline any             `json:"pipeline"`
+	Plugins  pipelinePlugins `json:"plugins"`
+	Reloads  any             `json:"reloads"`
+	Queue    pipelineQueue   `json:"queue"`
 }
 
 type plugin struct {
 	ID           string         `json:"id"`
 	Events       any            `json:"events"`
+	Flow         any            `json:"flow"`
 	Name         string         `json:"name"`
 	Failures     *int64         `json:"failures,omitempty"`
 	BulkRequests map[string]any `json:"bulk_requests"`
@@ -304,6 +307,16 @@ func gatherPluginsStats(plugins []plugin, pluginType string, tags map[string]str
 			accumulator.AddFields("logstash_plugins", failuresFields, pluginTags)
 		}
 		/*
+			The flow stats expose the worker utilization, worker cost per
+			event and the throughput of the plugin. Those metrics are
+			prefixed with "flow" to make them distinguishable from the
+			event metrics above.
+		*/
+		err = addFlattenedStats("logstash_plugins", "flow", plugin.Flow, pluginTags, accumulator)
+		if err != nil {
+			return err
+		}
+		/*
 			The elasticsearch & opensearch output produces additional stats
 			around bulk requests and document writes (that are elasticsearch
 			and opensearch specific). Collect those below:
@@ -360,6 +373,30 @@ func gatherPluginsStats(plugins []plugin, pluginType string, tags map[string]str
 			}
 			accumulator.AddFields("logstash_plugins", flattener.Fields, pluginTags)
 		}
+	}
+
+	return nil
+}
+
+// addFlattenedStats flattens the given JSON subtree of the node stats API and
+// adds the resulting fields to the accumulator. Subtrees that are not present
+// (older Logstash versions do not expose all of them) or that do not contain
+// any numeric value are skipped.
+func addFlattenedStats(
+	measurement string,
+	fieldPrefix string,
+	stats any,
+	tags map[string]string,
+	accumulator telegraf.Accumulator,
+) error {
+	flattener := parsers_json.JSONFlattener{}
+	err := flattener.FlattenJSON(fieldPrefix, stats)
+	if err != nil {
+		return err
+	}
+
+	if len(flattener.Fields) > 0 {
+		accumulator.AddFields(measurement, flattener.Fields, tags)
 	}
 
 	return nil
@@ -429,6 +466,30 @@ func (logstash *Logstash) gatherPipelineStats(address string, accumulator telegr
 	}
 	accumulator.AddFields("logstash_events", flattener.Fields, tags)
 
+	/*
+		The "pipeline" section contains the worker configuration of the
+		pipeline, e.g. the number of workers and the batch size.
+	*/
+	err = addFlattenedStats("logstash_pipeline", "", pipelineStats.Pipeline.Pipeline, tags, accumulator)
+	if err != nil {
+		return err
+	}
+
+	/*
+		The "flow" section contains throughput and worker utilization
+		statistics of the pipeline.
+	*/
+	err = addFlattenedStats("logstash_flow", "", pipelineStats.Pipeline.Flow, tags, accumulator)
+	if err != nil {
+		return err
+	}
+
+	// The "reloads" section contains the number of pipeline reloads.
+	err = addFlattenedStats("logstash_reloads", "", pipelineStats.Pipeline.Reloads, tags, accumulator)
+	if err != nil {
+		return err
+	}
+
 	err = gatherPluginsStats(pipelineStats.Pipeline.Plugins.Inputs, "input", tags, accumulator)
 	if err != nil {
 		return err
@@ -474,6 +535,30 @@ func (logstash *Logstash) gatherPipelinesStats(address string, accumulator teleg
 			return err
 		}
 		accumulator.AddFields("logstash_events", flattener.Fields, tags)
+
+		/*
+			The "pipeline" section contains the worker configuration of the
+			pipeline, e.g. the number of workers and the batch size.
+		*/
+		err = addFlattenedStats("logstash_pipeline", "", pipeline.Pipeline, tags, accumulator)
+		if err != nil {
+			return err
+		}
+
+		/*
+			The "flow" section contains throughput and worker utilization
+			statistics of the pipeline.
+		*/
+		err = addFlattenedStats("logstash_flow", "", pipeline.Flow, tags, accumulator)
+		if err != nil {
+			return err
+		}
+
+		// The "reloads" section contains the number of pipeline reloads.
+		err = addFlattenedStats("logstash_reloads", "", pipeline.Reloads, tags, accumulator)
+		if err != nil {
+			return err
+		}
 
 		err = gatherPluginsStats(pipeline.Plugins.Inputs, "input", tags, accumulator)
 		if err != nil {
