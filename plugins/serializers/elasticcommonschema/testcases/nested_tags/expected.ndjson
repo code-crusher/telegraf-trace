@@ -1,0 +1,1 @@
+{"@timestamp":"2023-04-27T16:30:51Z","container":{"name":"telegraf"},"ecs":{"version":"9.0.0"},"event":{"dataset":"kubernetes"},"host":"Hugin","kubernetes":{"replicas":3},"orchestrator":{"cluster":{"name":"monitoring"},"namespace":"kube-system","resource":{"name":"telegraf-pod"}},"service":{"name":"telegraf"}}

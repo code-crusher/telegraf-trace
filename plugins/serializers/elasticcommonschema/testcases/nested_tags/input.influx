@@ -1,0 +1,1 @@
+kubernetes,host=Hugin,orchestrator.cluster.name=monitoring,orchestrator.namespace=kube-system,orchestrator.resource.name=telegraf-pod,service.name=telegraf,container.name=telegraf replicas=3i 1682613051000000000

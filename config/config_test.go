@@ -660,6 +660,7 @@ func TestConfig_SerializerInterfaceNewFormat(t *testing.T) {
 	formats := []string{
 		"carbon2",
 		"csv",
+		"elasticcommonschema",
 		"graphite",
 		"influx",
 		"json",

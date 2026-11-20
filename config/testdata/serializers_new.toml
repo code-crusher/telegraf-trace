@@ -5,6 +5,9 @@
   data_format = "csv"
 
 [[outputs.serializer_test_new]]
+  data_format = "elasticcommonschema"
+
+[[outputs.serializer_test_new]]
   data_format = "graphite"
 
 [[outputs.serializer_test_new]]
