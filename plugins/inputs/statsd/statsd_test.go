@@ -3,6 +3,7 @@ package statsd
 import (
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -759,6 +760,100 @@ func TestParse_Timings(t *testing.T) {
 	}
 
 	acc.AssertContainsFields(t, "test_timing", valid)
+}
+
+func TestParse_Timings_IncludeStats(t *testing.T) {
+	tests := []struct {
+		name     string
+		include  []string
+		expected []string
+	}{
+		{
+			name:     "unset includes all statistics",
+			expected: []string{"count", "lower", "mean", "median", "stddev", "sum", "upper"},
+		},
+		{
+			name:     "wildcard includes all statistics",
+			include:  []string{"*"},
+			expected: []string{"count", "lower", "mean", "median", "stddev", "sum", "upper"},
+		},
+		{
+			name:     "single statistic",
+			include:  []string{"count"},
+			expected: []string{"count"},
+		},
+		{
+			name:     "multiple statistics",
+			include:  []string{"count", "mean", "sum"},
+			expected: []string{"count", "mean", "sum"},
+		},
+	}
+
+	allStats := []string{"count", "lower", "mean", "median", "stddev", "sum", "upper"}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStatsd()
+			s.IncludeStats = tt.include
+			require.NoError(t, s.Init())
+
+			parser, err := s.newGraphiteParser()
+			require.NoError(t, err)
+
+			acc := &testutil.Accumulator{}
+			for _, line := range []string{"test.timing:1|ms", "test.timing:11|ms"} {
+				require.NoError(t, s.parseStatsdLine(parser, line))
+			}
+			require.NoError(t, s.Gather(acc))
+
+			for _, stat := range allStats {
+				if slices.Contains(tt.expected, stat) {
+					require.Truef(t, acc.HasField("test_timing", stat), "expected field %q to be present", stat)
+				} else {
+					require.Falsef(t, acc.HasField("test_timing", stat), "expected field %q to be absent", stat)
+				}
+			}
+		})
+	}
+}
+
+func TestInit_IncludeStats(t *testing.T) {
+	tests := []struct {
+		name     string
+		include  []string
+		expected string
+	}{
+		{
+			name:    "valid statistics",
+			include: []string{"count", "lower", "mean", "median", "stddev", "sum", "upper", "*"},
+		},
+		{
+			name:    "no statistics",
+			include: []string{},
+		},
+		{
+			name:     "invalid statistic",
+			include:  []string{"mean", "foo"},
+			expected: `invalid include statistics "foo"`,
+		},
+		{
+			name:     "percentile is not a statistic",
+			include:  []string{"90_percentile"},
+			expected: `invalid include statistics "90_percentile"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStatsd()
+			s.IncludeStats = tt.include
+			err := s.Init()
+			if tt.expected == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tt.expected)
+			}
+		})
+	}
 }
 
 func TestParse_Timings_TimingsAsFloat(t *testing.T) {

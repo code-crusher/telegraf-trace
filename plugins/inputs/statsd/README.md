@@ -69,6 +69,11 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
   ## Percentiles to calculate for timing & histogram stats.
   percentiles = [50.0, 90.0, 99.0, 99.9, 99.95, 100.0]
 
+  ## Restrict computed statistics fields; available settings are
+  ## "count", "lower", "mean", "median", "stddev", "sum" and "upper".
+  ## Statistics not included are not computed, saving CPU time.
+  # include_stats = ["*"]
+
   ## separator to use between elements of a statsd metric
   metric_separator = "_"
 
@@ -244,6 +249,9 @@ metric type:
         that `P%` of all the values statsd saw for that stat during that time
         period are below x. The most common value that people use for `P` is the
         `90`, this is a great number to try to optimize.
+  - The statistics to compute can be restricted using the `include_stats`
+    option, e.g. `include_stats = ["count", "mean"]`. Statistics that are not
+    included are not calculated, which reduces CPU usage.
 - Distributions
   - The Distribution metric represents the global statistical distribution of a
     set of values calculated across your entire distributed infrastructure in

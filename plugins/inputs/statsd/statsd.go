@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/filter"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/parsers/graphite"
@@ -40,6 +42,10 @@ const (
 	defaultAllowPendingMessage = 10000
 )
 
+// timerStats contains the names of the statistics computed for timing and
+// histogram metrics. They can be selected via the "include_stats" option.
+var timerStats = []string{"count", "lower", "mean", "median", "stddev", "sum", "upper"}
+
 type Statsd struct {
 	// Protocol used on listener - udp or tcp
 	Protocol string `toml:"protocol"`
@@ -56,14 +62,19 @@ type Statsd struct {
 	// and histogram stats.
 	Percentiles     []Number `toml:"percentiles"`
 	PercentileLimit int      `toml:"percentile_limit"`
-	DeleteGauges    bool     `toml:"delete_gauges"`
-	DeleteCounters  bool     `toml:"delete_counters"`
-	DeleteSets      bool     `toml:"delete_sets"`
-	DeleteTimings   bool     `toml:"delete_timings"`
-	ConvertNames    bool     `toml:"convert_names"`
-	FloatCounters   bool     `toml:"float_counters"`
-	FloatTimings    bool     `toml:"float_timings"`
-	FloatSets       bool     `toml:"float_sets"`
+
+	// IncludeStats specifies which statistics are computed for timing and
+	// histogram metrics. An empty list computes all of them.
+	IncludeStats []string `toml:"include_stats"`
+
+	DeleteGauges   bool `toml:"delete_gauges"`
+	DeleteCounters bool `toml:"delete_counters"`
+	DeleteSets     bool `toml:"delete_sets"`
+	DeleteTimings  bool `toml:"delete_timings"`
+	ConvertNames   bool `toml:"convert_names"`
+	FloatCounters  bool `toml:"float_counters"`
+	FloatTimings   bool `toml:"float_timings"`
+	FloatSets      bool `toml:"float_sets"`
 
 	EnableAggregationTemporality bool `toml:"enable_aggregation_temporality"`
 
@@ -131,6 +142,9 @@ type Statsd struct {
 	bufPool sync.Pool // pool of byte slices to handle parsing
 
 	lastGatherTime time.Time
+
+	// Filter for selecting the statistics computed for timings & histograms
+	statsFilter filter.Filter
 
 	Stats internalStats
 }
@@ -224,6 +238,23 @@ type cacheddistributions struct {
 
 func (*Statsd) SampleConfig() string {
 	return sampleConfig
+}
+
+func (s *Statsd) Init() error {
+	for _, include := range s.IncludeStats {
+		if include != "*" && !slices.Contains(timerStats, include) {
+			return fmt.Errorf("invalid include statistics %q", include)
+		}
+	}
+
+	// An empty list of statistics includes all of them
+	f, err := filter.Compile(s.IncludeStats)
+	if err != nil {
+		return fmt.Errorf("compiling statistics filter failed: %w", err)
+	}
+	s.statsFilter = f
+
+	return nil
 }
 
 func (s *Statsd) Start(ac telegraf.Accumulator) error {
@@ -352,16 +383,30 @@ func (s *Statsd) Gather(acc telegraf.Accumulator) error {
 			if fieldName != defaultFieldName {
 				prefix = fieldName + "_"
 			}
-			fields[prefix+"mean"] = stats.mean()
-			fields[prefix+"median"] = stats.median()
-			fields[prefix+"stddev"] = stats.stddev()
-			fields[prefix+"sum"] = stats.sum()
-			fields[prefix+"upper"] = stats.upper()
-			fields[prefix+"lower"] = stats.lower()
-			if s.FloatTimings {
-				fields[prefix+"count"] = float64(stats.count())
-			} else {
-				fields[prefix+"count"] = stats.count()
+			if s.includeStat("mean") {
+				fields[prefix+"mean"] = stats.mean()
+			}
+			if s.includeStat("median") {
+				fields[prefix+"median"] = stats.median()
+			}
+			if s.includeStat("stddev") {
+				fields[prefix+"stddev"] = stats.stddev()
+			}
+			if s.includeStat("sum") {
+				fields[prefix+"sum"] = stats.sum()
+			}
+			if s.includeStat("upper") {
+				fields[prefix+"upper"] = stats.upper()
+			}
+			if s.includeStat("lower") {
+				fields[prefix+"lower"] = stats.lower()
+			}
+			if s.includeStat("count") {
+				if s.FloatTimings {
+					fields[prefix+"count"] = float64(stats.count())
+				} else {
+					fields[prefix+"count"] = stats.count()
+				}
 			}
 			for _, percentile := range s.Percentiles {
 				name := fmt.Sprintf("%s%v_percentile", prefix, percentile)
@@ -829,6 +874,12 @@ func parseKeyValue(keyValue string) (key, val string) {
 	}
 
 	return key, val
+}
+
+// includeStat returns true if the given statistics field should be computed.
+// All fields are computed if the "include_stats" option is not set.
+func (s *Statsd) includeStat(name string) bool {
+	return s.statsFilter == nil || s.statsFilter.Match(name)
 }
 
 // aggregate takes in a metric. It then
