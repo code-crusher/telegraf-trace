@@ -21,6 +21,7 @@ import (
 	commontls "github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/influxdata/telegraf/plugins/serializers/influx"
+	"github.com/influxdata/telegraf/selfstat"
 )
 
 //go:embed sample.conf
@@ -45,6 +46,7 @@ type InfluxDB struct {
 	ReadIdleTimeout  config.Duration           `toml:"read_idle_timeout"`
 	ConcurrentWrites uint64                    `toml:"concurrent_writes"`
 	Log              telegraf.Logger           `toml:"-"`
+	Statistics       *selfstat.Collector       `toml:"-"`
 	commontls.ClientConfig
 	ratelimiter.RateLimitConfig
 
@@ -52,6 +54,8 @@ type InfluxDB struct {
 	encoder    internal.ContentEncoder
 	serializer ratelimiter.Serializer
 	tlsCfg     *tls.Config
+
+	bytesWritten selfstat.Stat
 }
 
 func (*InfluxDB) SampleConfig() string {
@@ -98,6 +102,18 @@ func (i *InfluxDB) Init() error {
 		return fmt.Errorf("setting up TLS failed: %w", err)
 	}
 	i.tlsCfg = tlsCfg
+
+	// Register internal statistics. The configured bucket is exposed as tag to
+	// allow identifying the destination of this output instance in the
+	// "internal_influxdb_v2" measurement.
+	if i.Statistics == nil {
+		i.Statistics = selfstat.NewCollector(nil)
+	}
+	tags := make(map[string]string, 1)
+	if i.Bucket != "" {
+		tags["bucket"] = i.Bucket
+	}
+	i.bytesWritten = i.Statistics.Register("influxdb_v2", "bytes_written", tags)
 
 	return nil
 }
@@ -171,6 +187,7 @@ func (i *InfluxDB) Connect() error {
 				serializer:       i.serializer,
 				concurrent:       i.ConcurrentWrites,
 				log:              i.Log,
+				bytesWritten:     i.bytesWritten,
 			}
 
 			if err := c.Init(); err != nil {

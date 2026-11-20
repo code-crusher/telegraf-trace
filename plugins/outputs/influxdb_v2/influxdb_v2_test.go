@@ -23,8 +23,10 @@ import (
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/metric"
+	"github.com/influxdata/telegraf/models"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	influxdb "github.com/influxdata/telegraf/plugins/outputs/influxdb_v2"
+	"github.com/influxdata/telegraf/selfstat"
 	"github.com/influxdata/telegraf/testutil"
 )
 
@@ -1184,6 +1186,176 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 	require.NoError(t, plugin.Write(metrics))
 	require.Equal(t, int32(totalMetrics), received.Load(), "unexpected received metrics count")
+}
+
+func TestWriteStatisticsBucket(t *testing.T) {
+	tests := []struct {
+		name     string
+		bucket   string
+		expected map[string]string
+	}{
+		{
+			name:     "with bucket",
+			bucket:   "my_bucket",
+			expected: map[string]string{"bucket": "my_bucket"},
+		},
+		{
+			name:     "without bucket",
+			expected: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin := &influxdb.InfluxDB{
+				Bucket:     tt.bucket,
+				Log:        &testutil.Logger{},
+				Statistics: selfstat.NewCollector(map[string]string{"output": "influxdb_v2"}),
+			}
+			defer plugin.Statistics.UnregisterAll()
+
+			require.NoError(t, plugin.Init())
+
+			stat := plugin.Statistics.Get("influxdb_v2", "bytes_written", tt.expected)
+			require.NotNil(t, stat, "bytes_written statistic not registered")
+
+			// The collector tags must be merged with the plugin tags
+			tags := stat.Tags()
+			require.Equal(t, "influxdb_v2", tags["output"])
+			if tt.bucket != "" {
+				require.Equal(t, tt.bucket, tags["bucket"])
+			} else {
+				require.NotContains(t, tags, "bucket")
+			}
+		})
+	}
+}
+
+func TestWriteStatisticsExposedAsSelfMetrics(t *testing.T) {
+	// Setup a test server
+	ts := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	)
+	defer ts.Close()
+
+	// Setup the plugin as the agent does it, i.e. with the statistics collector
+	// being injected by the model
+	plugin := &influxdb.InfluxDB{
+		URLs:            []string{"http://" + ts.Listener.Addr().String()},
+		Bucket:          "selfmetrics_bucket",
+		ContentEncoding: "identity",
+	}
+	models.SetLoggerOnPlugin(plugin, testutil.Logger{})
+	models.SetStatisticsOnPlugin(plugin, testutil.Logger{}, map[string]string{
+		"output": "influxdb_v2",
+		"_id":    "1234",
+		"alias":  "myalias",
+	})
+	defer plugin.Statistics.UnregisterAll()
+
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	defer plugin.Close()
+
+	metrics := []telegraf.Metric{
+		metric.New("cpu", nil, map[string]any{"value": 42.0}, time.Unix(0, 0)),
+	}
+	require.NoError(t, plugin.Write(metrics))
+
+	// Find the emitted self metric and verify the bucket is exposed as tag
+	var found bool
+	for _, m := range selfstat.Metrics() {
+		if m.Name() != "internal_influxdb_v2" {
+			continue
+		}
+		tags := m.Tags()
+		if tags["bucket"] != "selfmetrics_bucket" {
+			continue
+		}
+		found = true
+		require.Equal(t, "influxdb_v2", tags["output"])
+		require.Equal(t, "myalias", tags["alias"])
+		require.EqualValues(t, len("cpu value=42 0\n"), m.Fields()["bytes_written"])
+	}
+	require.True(t, found, "no internal_influxdb_v2 metric with the configured bucket found")
+}
+
+func TestWriteBytesWritten(t *testing.T) {
+	// Setup a test server
+	ts := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	)
+	defer ts.Close()
+
+	// Setup plugin and connect. Use a dedicated bucket name to not interfere
+	// with statistics registered by other tests in the global registry.
+	plugin := &influxdb.InfluxDB{
+		URLs:            []string{"http://" + ts.Listener.Addr().String()},
+		Bucket:          "bytes_written_test",
+		ContentEncoding: "identity",
+		Log:             &testutil.Logger{},
+		Statistics:      selfstat.NewCollector(nil),
+	}
+	defer plugin.Statistics.UnregisterAll()
+
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	defer plugin.Close()
+
+	metrics := []telegraf.Metric{
+		metric.New("cpu", nil, map[string]any{"value": 42.0}, time.Unix(0, 0)),
+	}
+	expected := int64(len("cpu value=42 0\n"))
+
+	stat := plugin.Statistics.Get("influxdb_v2", "bytes_written", map[string]string{"bucket": "bytes_written_test"})
+	require.NotNil(t, stat, "bytes_written statistic not registered")
+	require.Zero(t, stat.Get())
+
+	require.NoError(t, plugin.Write(metrics))
+	require.EqualValues(t, expected, stat.Get())
+
+	// Writing the same batch again must accumulate the bytes
+	require.NoError(t, plugin.Write(metrics))
+	require.EqualValues(t, 2*expected, stat.Get())
+}
+
+func TestWriteBytesWrittenOnFailure(t *testing.T) {
+	// Setup a test server rejecting the request
+	ts := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		}),
+	)
+	defer ts.Close()
+
+	// Setup plugin and connect. Use a dedicated bucket name to not interfere
+	// with statistics registered by other tests in the global registry.
+	plugin := &influxdb.InfluxDB{
+		URLs:            []string{"http://" + ts.Listener.Addr().String()},
+		Bucket:          "bytes_written_failure_test",
+		ContentEncoding: "identity",
+		Log:             &testutil.Logger{},
+		Statistics:      selfstat.NewCollector(nil),
+	}
+	defer plugin.Statistics.UnregisterAll()
+
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	defer plugin.Close()
+
+	metrics := []telegraf.Metric{
+		metric.New("cpu", nil, map[string]any{"value": 42.0}, time.Unix(0, 0)),
+	}
+	require.ErrorContains(t, plugin.Write(metrics), "failed to write metrics to bytes_written_failure_test")
+
+	// Only successfully written payloads are accounted for
+	stat := plugin.Statistics.Get("influxdb_v2", "bytes_written", map[string]string{"bucket": "bytes_written_failure_test"})
+	require.NotNil(t, stat, "bytes_written statistic not registered")
+	require.Zero(t, stat.Get())
 }
 
 func BenchmarkWrite1k(b *testing.B) {

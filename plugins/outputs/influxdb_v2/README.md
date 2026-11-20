@@ -119,3 +119,20 @@ more details on how to use them.
 Reference the [influx serializer][] for details about metric production.
 
 [influx serializer]: /plugins/serializers/influx/README.md#Metrics
+
+## Internal metrics
+
+The plugin exposes the following internal metric, which can be collected with
+the [internal input plugin][internal]:
+
+- internal_influxdb_v2
+  - bytes_written -- number of bytes of the (possibly compressed) request
+                     payload successfully written
+
+The metric is tagged with the configured `bucket` (if set) in addition to the
+`output` and `alias` tags added by the agent. This allows identifying which
+bucket each `outputs.influxdb_v2` instance writes to. Note that when
+`bucket_tag` is configured, the actual destination bucket is determined per
+metric by that tag and the `bucket` tag reports the configured fallback only.
+
+[internal]: /plugins/inputs/internal/README.md

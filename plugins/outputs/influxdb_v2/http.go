@@ -27,6 +27,7 @@ import (
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/common/ratelimiter"
+	"github.com/influxdata/telegraf/selfstat"
 )
 
 const (
@@ -59,6 +60,7 @@ type httpClient struct {
 	retryCount       atomic.Int64
 	concurrent       uint64
 	log              telegraf.Logger
+	bytesWritten     selfstat.Stat
 
 	// Mutex to protect the retry-time field
 	sync.Mutex
@@ -364,6 +366,7 @@ func (c *httpClient) writeBatch(ctx context.Context, b *batch) error {
 		http.StatusMultiStatus,
 		http.StatusAlreadyReported:
 		c.retryCount.Store(0)
+		c.bytesWritten.Incr(int64(payloadSize))
 		c.log.Tracef(
 			"Request to %s succeeded in %s: metrics=%d, size=%d bytes (%.2f KB), bucket=%q",
 			c.url, elapsed, metricCount, payloadSize, float64(payloadSize)/1024, b.bucket,
