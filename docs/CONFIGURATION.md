@@ -787,7 +787,9 @@ metrics entering the plugin or on the metrics it produces.
   Selected metrics (with modifiers applied) are fed into the aggregation, while
   metrics that do not match are passed downstream. Whether the original,
   matching metrics are also forwarded to subsequent output plugins is controlled
-  by the aggregator's `drop_original` setting.
+  by the aggregator's `drop_original` setting; it only applies to metrics that
+  were actually aggregated. Metrics with timestamps outside the current
+  aggregation window are never aggregated and are always passed downstream.
 
 - **Output plugins** apply filters *before* writing. Only metrics that pass the
   selectors, with their tags and fields adjusted by any modifiers, are sent to

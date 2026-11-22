@@ -170,7 +170,7 @@ func (r *RunningAggregator) Add(m telegraf.Metric) bool {
 		r.log.Debugf("Metric is outside aggregation window; discarding. %s: m: %s e: %s g: %s",
 			m.Time(), r.periodStart, r.periodEnd, r.Config.Grace)
 		r.MetricsDropped.Incr(1)
-		return r.Config.DropOriginal
+		return false
 	}
 
 	r.Aggregator.Add(m)

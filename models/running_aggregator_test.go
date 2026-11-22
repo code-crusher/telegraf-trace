@@ -214,6 +214,53 @@ func TestRunningAggregatorAddDropOriginal(t *testing.T) {
 	require.False(t, ra.Add(m2))
 }
 
+// Metrics outside the aggregation window are not aggregated, so they must not
+// be dropped even with drop_original set, see issue #18257.
+func TestRunningAggregatorAddDropOriginalOutsidePeriod(t *testing.T) {
+	ra := NewRunningAggregator(&mockAggregator{}, &AggregatorConfig{
+		Name: "TestRunningAggregator",
+		Filter: Filter{
+			NamePass: []string{"RI*"},
+		},
+		Period:       time.Millisecond * 500,
+		DropOriginal: true,
+	})
+	require.NoError(t, ra.Config.Filter.Compile())
+
+	now := time.Now()
+	ra.UpdateWindow(now, now.Add(ra.Config.Period))
+
+	// metric before the current period, ignoring the grace period
+	m := metric.New("RITest",
+		map[string]string{},
+		map[string]any{
+			"value": int64(101),
+		},
+		now.Add(-time.Hour),
+		telegraf.Untyped)
+	require.False(t, ra.Add(m))
+
+	// metric after the current period
+	m = metric.New("RITest",
+		map[string]string{},
+		map[string]any{
+			"value": int64(101),
+		},
+		now.Add(time.Hour),
+		telegraf.Untyped)
+	require.False(t, ra.Add(m))
+
+	// metric inside the current period is aggregated and dropped
+	m = metric.New("RITest",
+		map[string]string{},
+		map[string]any{
+			"value": int64(101),
+		},
+		now.Add(time.Millisecond*100),
+		telegraf.Untyped)
+	require.True(t, ra.Add(m))
+}
+
 func TestRunningAggregatorAddDoesNotModifyMetric(t *testing.T) {
 	ra := NewRunningAggregator(&mockAggregator{}, &AggregatorConfig{
 		Name: "TestRunningAggregator",
