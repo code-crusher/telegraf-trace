@@ -168,7 +168,18 @@ IF @MajorMinorVersion > 1100 BEGIN
 	,vfs.[io_stall_queued_write_ms] AS [rg_write_stall_ms]'
 END
 
+/* Materialize the virtual file stats into a temporary table before joining them with
+sys.master_files. Table-valued functions are inlined into the query plan and re-evaluated
+for every row they are joined with, which lets the CPU usage of this query explode on
+SQL Server 2025 (see issue #18391). Reading the function once into a temporary table keeps
+the join and the output unchanged, while limiting the number of function evaluations to
+exactly one on every SQL Server version. The temporary table is scoped to the dynamic batch
+and is therefore always dropped when the batch finishes. */
 SET @SqlStatement = N'
+SELECT *
+INTO #vfs
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs;
+
 SELECT
 	''sqlserver_database_io'' AS [measurement]
 	,REPLACE(@@SERVERNAME,''\'','':'') AS [sql_instance]
@@ -182,11 +193,13 @@ SELECT
 	,vfs.[io_stall_write_ms] AS [write_latency_ms]
 	,vfs.[num_of_writes] AS [writes]
 	,vfs.[num_of_bytes_written] AS [write_bytes]'
-	+ @Columns + N'
-FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
++ @Columns + N'
+FROM #vfs AS vfs
 INNER JOIN sys.master_files AS mf WITH (NOLOCK)
 	ON vfs.[database_id] = mf.[database_id] AND vfs.[file_id] = mf.[file_id]'
-+ @Tables;
++ @Tables + N';
+
+DROP TABLE #vfs;';
 
 EXEC sp_executesql @SqlStatement
 `
